@@ -41,6 +41,20 @@ export function grow(bomb: boolean): string {
 }
 `;
 
+/**
+ * Same attack as OFF_HEAP_BOMB, but placed at module scope so it runs during
+ * `compile()` -- before the worker ever posts 'ready' and before any test is
+ * dispatched. Regression coverage for the RSS watchdog's `busy` gate, which used to
+ * be `false` for this entire window.
+ */
+export const OFF_HEAP_BOMB_AT_MODULE_SCOPE = `
+const hoard: Uint8Array[] = [];
+while (true) hoard.push(new Uint8Array(32 * 1024 * 1024).fill(1));
+export function grow(): string {
+  return 'fine';
+}
+`;
+
 /** Each of these must be stopped by static analysis before a sandbox exists. */
 export const STATICALLY_BLOCKED_ESCAPES: Record<string, string> = {
   'plain require': `

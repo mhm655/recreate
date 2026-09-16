@@ -120,6 +120,23 @@ describe('generateTests', () => {
     if (result.ok) assert.ok(result.tests.length <= 5);
   });
 
+  it('respects maxTests even when every overload contributes its own "typical" test', async () => {
+    // Regression: each overload signature contributes a `sigN-typical` test that
+    // sampleKeepingCoverage always used to keep, uncapped, before sampling the rest.
+    const analysis = await analysisOf(`
+      export function f(a: string): string;
+      export function f(a: string, b: string): string;
+      export function f(a: string, b: string, c: string): string;
+      export function f(a: string, b?: string, c?: string): string { return a; }
+    `);
+    assert.equal(analysis.signatures.length, 3);
+    for (const maxTests of [0, 1, 2, 3, 5]) {
+      const result = generateTests(analysis, { seed: 1, maxTests });
+      assert.equal(result.ok, true);
+      if (result.ok) assert.ok(result.tests.length <= maxTests, `maxTests=${maxTests} got ${result.tests.length}`);
+    }
+  });
+
   it('every generated test runs through the real pipeline against the actual function', async () => {
     const source = fs.readFileSync(path.resolve('examples/slugify.ts'), 'utf8');
     const analysis = await analysisOf(source);

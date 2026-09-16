@@ -114,8 +114,14 @@ export function valuesFor(shape: TypeShape, rng: Rng, budget: ValueBudget = DEFA
     case 'promise':
       throw new Error(`valuesFor called on a non-generatable shape: ${shape.kind} (${shape.text})`);
 
-    default:
-      return cap(rng, FALLBACK_VALUES, budget);
+    default: {
+      // Exhaustiveness guard, not a real fallback: every TypeShape kind is handled
+      // above. If this fires, TypeScript's own check below already failed to catch a
+      // new kind added to the union without a case here -- fail loudly rather than
+      // silently emit a plausible-looking fallback value for it.
+      const exhaustive: never = shape;
+      throw new Error(`valuesFor: unhandled TypeShape kind '${(exhaustive as TypeShape).kind}'`);
+    }
   }
 }
 

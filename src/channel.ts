@@ -47,7 +47,9 @@ export interface ParsedChannel<T> {
    * Lines present on the channel that failed verification or parsing.
    * `incomplete-line` is the benign case -- a container killed mid-write leaves a
    * partial final line -- and is reported separately so it is not mistaken for
-   * tampering.
+   * tampering. `oversize` is also benign: it is checked only after the signature
+   * verifies, so it means a genuine, correctly-signed result that was simply too
+   * large to accept, not a forged or garbage line.
    */
   rejected: Array<{
     reason: 'bad-signature' | 'bad-json' | 'malformed' | 'oversize' | 'incomplete-line';
@@ -93,10 +95,6 @@ export function parseChannel<T = unknown>(
       });
     };
 
-    if (Buffer.byteLength(line, 'utf8') > maxLineBytes) {
-      reject('oversize');
-      continue;
-    }
     const sep = line.indexOf(' ');
     if (sep !== 64) {
       reject('malformed');
@@ -111,6 +109,15 @@ export function parseChannel<T = unknown>(
     const expected = sign(key, json);
     if (!timingSafeEqual(Buffer.from(mac, 'hex'), Buffer.from(expected, 'hex'))) {
       reject('bad-signature');
+      continue;
+    }
+    // Checked AFTER authentication, on purpose: the encode budget (src/encoding.ts)
+    // can legitimately produce a multi-MB result, and the whole payload is already
+    // buffered in memory by this point, so verifying first costs nothing. That way
+    // 'oversize' always means "a genuine, signed line we won't accept," never a
+    // garbage/forged line that happens to be long -- those already failed above.
+    if (Buffer.byteLength(line, 'utf8') > maxLineBytes) {
+      reject('oversize');
       continue;
     }
     try {

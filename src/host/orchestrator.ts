@@ -339,9 +339,13 @@ export function reconcile(
     maxBytes: limits.maxResultBytes,
   });
 
+  // 'oversize' is deliberately excluded: src/channel.ts only applies that check
+  // after a line's signature verifies, so it means a genuine, correctly-signed
+  // result that was too large to accept -- not tampering.
   const forged = parsed.rejected.filter(
-    (r) => r.reason === 'bad-signature' || r.reason === 'malformed' || r.reason === 'oversize' || r.reason === 'bad-json',
+    (r) => r.reason === 'bad-signature' || r.reason === 'malformed' || r.reason === 'bad-json',
   );
+  const oversized = parsed.rejected.filter((r) => r.reason === 'oversize');
   const truncatedLines = parsed.rejected.filter((r) => r.reason === 'incomplete-line');
 
   if (forged.length) {
@@ -350,6 +354,15 @@ export function reconcile(
       detail:
         `${forged.length} line(s) on the result channel failed verification ` +
         `(first: ${forged[0].reason} "${forged[0].preview}"). Untrusted code wrote to the result fd.`,
+    });
+  }
+  if (oversized.length) {
+    problems.push({
+      code: 'result_line_too_large',
+      detail:
+        `${oversized.length} signed result(s) exceeded the per-line size limit and were not accepted ` +
+        `(first: "${oversized[0].preview}..."). Not tampering -- the encoded result was simply too large; ` +
+        'the affected test(s) will show up as missing.',
     });
   }
   if (parsed.truncated) {

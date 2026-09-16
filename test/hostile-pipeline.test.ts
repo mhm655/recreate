@@ -139,6 +139,23 @@ describe('hostile: memory bombs', () => {
     // that both hit the cap must still count as agreeing.
     assert.equal(report.verdict, 'ok', explain(report));
   });
+
+  it('off-heap growth at module scope, before any test runs, is also caught by the watchdog', async () => {
+    // Every worker spawn re-runs this module-level loop during compile(), so every
+    // test in the pass independently hits the cap and gets a fresh worker after.
+    const report = await run(H.OFF_HEAP_BOMB_AT_MODULE_SCOPE, [
+      { id: 'a', args: [] },
+      { id: 'b', args: [] },
+    ]);
+    for (const pass of report.passes) {
+      assert.equal(pass.status, 'ok', explain(report));
+      for (const r of pass.results) {
+        assert.equal(r.outcome.type, 'resource_limit', JSON.stringify(r.outcome));
+        assert.equal((r.outcome as { limit: string }).limit, 'memory');
+      }
+    }
+    assert.equal(report.verdict, 'ok', explain(report));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -558,6 +575,43 @@ describe('reconciliation edge cases (synthetic channel data)', () => {
     const key = newResultKey();
     const pass = reconcile('a', ['t1'], key, ok(line(key, 't1')), limits);
     assert.equal(pass.status, 'incomplete');
+  });
+
+  it('an oversize line is checked only after its signature verifies, so it is never mistaken for tampering', () => {
+    // Regression: 'oversize' used to be checked BEFORE signature verification, so a
+    // garbage/forged huge line and a genuine, correctly-signed-but-too-large result
+    // were indistinguishable -- both landed in the same 'forged' bucket.
+    const key = newResultKey();
+    const wrongKey = newResultKey();
+    const tinyBudget = { maxBytes: 1_000_000, maxLineBytes: 10 };
+
+    const genuine = parseChannel(key, line(key, 't1'), tinyBudget);
+    assert.equal(genuine.accepted.length, 0);
+    assert.equal(genuine.rejected[0].reason, 'oversize');
+
+    const forged = parseChannel(wrongKey, line(key, 't1'), tinyBudget);
+    assert.equal(forged.accepted.length, 0);
+    assert.equal(forged.rejected[0].reason, 'bad-signature', 'a wrong-key line must fail on signature, not size');
+  });
+
+  it('a genuine oversized result is reported as missing, not as tampering', () => {
+    const key = newResultKey();
+    const hugeResult = frame(key, {
+      kind: 'result',
+      result: {
+        testId: 't2',
+        outcome: { type: 'return', value: { t: 'str', v: 'x'.repeat(4_300_000) } },
+        argsAfterCall: { t: 'array', i: 0, v: [] },
+        consoleOutput: '',
+        durationMs: 0,
+        workerGeneration: 1,
+      },
+    });
+    const pass = reconcile('a', ['t1', 't2'], key, ok(line(key, 't1') + hugeResult + end(key)), limits);
+    assert.equal(pass.status, 'incomplete', JSON.stringify(pass.problems));
+    assert.ok(pass.problems.some((p) => p.code === 'result_line_too_large'), JSON.stringify(pass.problems));
+    assert.ok(pass.problems.some((p) => p.code === 'missing_results'), JSON.stringify(pass.problems));
+    assert.equal(pass.problems.some((p) => p.code === 'unsigned_channel_lines'), false, JSON.stringify(pass.problems));
   });
 });
 

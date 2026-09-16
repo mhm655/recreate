@@ -20,9 +20,9 @@ import * as esbuild from 'esbuild';
 /**
  * Vetted dependencies available to submissions, keyed by the exact specifier a
  * submission may `import`/`require`. Each entry must be a real dependency in
- * package.json -- `checkVendoredModulesInstalled` (called from tests) verifies that,
- * so this list can't silently drift from what's actually vendored into the host's
- * node_modules.
+ * package.json -- the "every vendored module is actually installed" test in
+ * test/bundle.test.ts verifies that, so this list can't silently drift from what's
+ * actually vendored into the host's node_modules.
  *
  * Adding an entry here is a supply-chain decision: the package's code runs, inlined,
  * as part of every submission that imports it. Vet the package (and its own

@@ -136,9 +136,15 @@ function dedupeById(tests: readonly GeneratedTest[]): GeneratedTest[] {
   return out;
 }
 
-/** Always keeps 'typical' and 'minimal'; samples the rest down to the cap. */
+/**
+ * Prefers 'typical'/'minimal' tests, then fills the rest of the cap by sampling the
+ * remainder -- but `max` is a hard cap (see GenerateOptions.maxTests), so even the
+ * preferred set is itself sampled down to `max` when there are more of them than
+ * that (e.g. an overloaded function contributes one 'typical' per signature).
+ */
 function sampleKeepingCoverage(tests: readonly GeneratedTest[], max: number, rng: Rng): GeneratedTest[] {
-  const kept = tests.filter((t) => t.id.endsWith('typical') || t.id.endsWith('minimal'));
-  const rest = tests.filter((t) => !kept.includes(t));
+  const priority = tests.filter((t) => t.id.endsWith('typical') || t.id.endsWith('minimal'));
+  const rest = tests.filter((t) => !priority.includes(t));
+  const kept = rng.sample(priority, Math.min(priority.length, max));
   return [...kept, ...rng.sample(rest, Math.max(0, max - kept.length))];
 }

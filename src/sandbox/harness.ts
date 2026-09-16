@@ -108,12 +108,18 @@ type RunOutcome =
   | { kind: 'timeout' }
   | { kind: 'died'; limit: 'memory' | 'worker_died'; detail: string };
 
+type EnsureResult =
+  | { ok: true }
+  /** `limit` is set when a worker that was still compiling got killed by the RSS
+   * watchdog or died outright, as opposed to a deterministic compile failure. */
+  | { ok: false; detail: string; limit?: 'memory' | 'worker_died' };
+
 class WorkerSupervisor {
   private worker: Worker | null = null;
   private pending:
     | { testId: string; resolve: (r: RunOutcome) => void; timer: NodeJS.Timeout }
     | null = null;
-  private readyWaiters: Array<(r: { ok: true } | { ok: false; detail: string }) => void> = [];
+  private readyWaiters: Array<(r: EnsureResult) => void> = [];
   private initFailure: string | null = null;
   /** Teardown of the previous worker; awaited before a replacement is spawned. */
   private terminating: Promise<unknown> = Promise.resolve();
@@ -125,7 +131,7 @@ class WorkerSupervisor {
   ) {}
 
   /** Spawn a worker if needed and wait for it to finish compiling the submission. */
-  async ensure(): Promise<{ ok: true } | { ok: false; detail: string }> {
+  async ensure(): Promise<EnsureResult> {
     if (this.initFailure) return { ok: false, detail: this.initFailure };
     if (this.worker) return { ok: true };
 
@@ -202,9 +208,16 @@ class WorkerSupervisor {
     }
   }
 
-  /** True while a test is executing, which is the only time the watchdog may act. */
+  /**
+   * True whenever a worker process exists at all, which is the only time the
+   * watchdog may act. This has to cover compile, not just an in-flight `run()`: a
+   * submission's top-level module code executes synchronously inside `compile()`
+   * (src/sandbox/worker.ts), before the worker ever posts 'ready', so an off-heap
+   * allocation placed outside the entry function would otherwise run during a
+   * window the watchdog never polls.
+   */
   get busy(): boolean {
-    return this.pending !== null;
+    return this.worker !== null;
   }
 
   /** Called by the RSS watchdog. */
@@ -217,9 +230,13 @@ class WorkerSupervisor {
     this.worker = null;
     if (worker) this.terminating = worker.terminate().catch(() => {});
 
+    // Distinguishes "killed while still compiling" from a deterministic compile
+    // failure (src/sandbox/worker.ts's 'init-failed'), which never sets `limit`: the
+    // former is a resource_limit outcome for whichever test triggered `ensure()`,
+    // the latter is a harness_error that would recur identically on any retry.
     const waiters = this.readyWaiters;
     this.readyWaiters = [];
-    for (const w of waiters) w({ ok: false, detail: info.detail });
+    for (const w of waiters) w({ ok: false, detail: info.detail, limit: info.limit });
 
     const p = this.pending;
     if (p) {
@@ -332,13 +349,19 @@ async function main(): Promise<number> {
     const started = Date.now();
     const ready = await sup.ensure();
     if (!ready.ok) {
-      // Compile failure, or a worker that will not start. Report per test so the
-      // host still sees a complete, reconcilable result set.
+      // `ready.limit` set: the watchdog (or an outright crash) killed the worker
+      // while it was still compiling -- a resource_limit, not a harness bug.
+      // Unset: a deterministic compile failure, which would recur identically on
+      // any retry. Report per test either way, so the host still sees a complete,
+      // reconcilable result set.
+      const outcome: Outcome = ready.limit
+        ? { type: 'resource_limit', limit: ready.limit, detail: ready.detail }
+        : { type: 'harness_error', detail: ready.detail };
       emit({
         kind: 'result',
         result: {
           testId: test.id,
-          outcome: { type: 'harness_error', detail: ready.detail },
+          outcome,
           argsAfterCall: emptyArgs,
           consoleOutput: '',
           durationMs: Date.now() - started,
