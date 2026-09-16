@@ -127,6 +127,14 @@ describe('import guard: entry point resolution', () => {
     assert.equal(r.ok && r.entryName, 'slugify');
   });
 
+  it('treats overload declarations and their implementation as one function', () => {
+    const r = checkSource(`
+      export function pad(s: string): string;
+      export function pad(n: number, width: number): string;
+      export function pad(x: string | number, width = 2): string { return String(x).padStart(width); }`);
+    assert.equal(r.ok && r.entryName, 'pad', JSON.stringify(r));
+  });
+
   it('rejects ambiguity instead of guessing', () => {
     assertRejected('export function a() {} export function b() {}', 'ambiguous-entry-point');
   });

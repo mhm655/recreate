@@ -242,8 +242,16 @@ function resolveEntryPoint(sf: ts.SourceFile, requested?: string): EntryResoluti
     const isDefault = mods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
 
     if (ts.isFunctionDeclaration(stmt)) {
-      if (stmt.name) candidates.push({ name: stmt.name.text, exported, isDefault });
-      else if (isDefault) hasAnonymousDefault = true;
+      if (stmt.name) {
+        // Overload declarations and their implementation share one name: one function.
+        const existing = candidates.find((c) => c.name === stmt.name!.text);
+        if (existing) {
+          existing.exported ||= exported;
+          existing.isDefault ||= isDefault;
+        } else {
+          candidates.push({ name: stmt.name.text, exported, isDefault });
+        }
+      } else if (isDefault) hasAnonymousDefault = true;
     } else if (ts.isVariableStatement(stmt)) {
       for (const decl of stmt.declarationList.declarations) {
         if (!ts.isIdentifier(decl.name) || !decl.initializer) continue;
