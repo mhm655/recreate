@@ -1,0 +1,11 @@
+{
+  "entryName": "slugify",
+  "tests": [
+    { "id": "basic", "args": ["Hello World"] },
+    { "id": "accents", "args": ["Crème Brûlée recipe"] },
+    { "id": "punctuation", "args": ["  --What?! Is this... --  "] },
+    { "id": "truncate", "args": ["a very long title that keeps going and going and going", 10] },
+    { "id": "empty", "args": [""] },
+    { "id": "nan-length", "args": ["NaN as a length", "@@NaN"] }
+  ]
+}

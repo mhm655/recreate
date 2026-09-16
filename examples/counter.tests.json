@@ -1,0 +1,5 @@
+[
+  { "id": "support", "args": ["support"] },
+  { "id": "billing", "args": ["billing"] },
+  { "id": "sales", "args": ["sales"] }
+]
