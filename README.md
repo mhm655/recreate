@@ -18,7 +18,7 @@ Each layer has one job. Two of them are **not** security boundaries, and the cod
 |---|---|---|
 | **Static import allowlist** (host) | Reject module references outside an explicit allowlist before any container exists | No. It gives early, readable errors. The global-identifier check is a best-effort blocklist and is trivially bypassed. |
 | **gVisor container** (`runsc`) | Isolate untrusted code from the host kernel: no network, read-only rootfs, noexec tmpfs, non-root, `cap-drop=ALL`, `no-new-privileges`, seccomp, memory/CPU/pid cgroups | **Yes. This is the boundary.** |
-| **Seccomp profile** | Allowlist of syscalls. `clone` is allowed only for threads, so nothing in the container can create a process | Yes, defence in depth under gVisor |
+| **Seccomp profile** | Allowlist of syscalls. `clone` is allowed only for threads, so glibc `fork()` and libuv (and so `child_process`) can't create a process. `clone3` has to be allowed under gVisor and can't be filtered, so a raw `clone3` from native code isn't covered | Yes, defence in depth under gVisor |
 | **Worker thread** | *Interruptibility.* A synchronous `while(true){}` never yields, so no timer on its own thread can fire. The parent thread calls `worker.terminate()` | **No.** It shares the process, its file descriptors and its address space |
 | **`vm` context** | *Realm hygiene.* Fresh intrinsics, no `require`/`process`/timers, string code generation disabled. Prototype pollution can't corrupt the encoder or message plumbing | **No.** `vm` is not a sandbox |
 | **Result-channel HMAC + id reconciliation** (host) | Stop a submission from fabricating its own results | No. It protects the integrity of the *report* (see [Known limitations](#known-limitations)) |
@@ -235,8 +235,15 @@ The tamper tests inject a `--require` preload into the sandbox process. It attac
 
 ### Verification status
 
-- **Verified on Windows 10 / Node 26:** all 109 tests (70 unit, 39 hostile) via `LocalRunner`, plus the CLI paths.
-- **Not yet verified:** the Dockerfile build, `docker/seccomp.json`, the gVisor-specific behaviour and the container OOM test. There was no Linux/gVisor host while writing this. The seccomp profile is the most likely part to need adjusting: its thread-only `clone` rule is strict by design. If Node won't start under it, temporarily switch the default action to `SCMP_ACT_LOG`, run once, and read the denied syscalls from the audit log.
+- **Windows 10 / Node 26:** all 109 tests via `LocalRunner`, plus the CLI paths.
+- **CI, GitHub Ubuntu runners with gVisor `release-20260907.0` and `--oci-seccomp`** ([workflow](.github/workflows/sandbox.yml)):
+  - the full local suite;
+  - `verify-isolation` from inside a production-flagged container: non-root, read-only root mount, no network egress (`EPERM`), process creation blocked (`EPERM`), worker threads working, gVisor kernel;
+  - both examples;
+  - the hostile suite against Docker, including the container OOM test.
+
+  The tamper and host-kill tests run only under `LocalRunner`, by design.
+- **What CI turned up:** gVisor with `--oci-seccomp` breaks Node under any profile that refuses `clone3`, Docker's default included. The profile now allows `clone3`, trading away some coverage (see the profile's comments). `scripts/diagnose-seccomp.sh` reproduces the finding and runs automatically in CI if the isolation checks ever fail.
 
 ---
 

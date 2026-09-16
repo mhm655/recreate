@@ -290,7 +290,13 @@ const rec = (check, ok, detail) => results.push({ check, ok: !!ok, detail: Strin
 const code = (e) => (e && (e.code || e.message)) || String(e);
 
 try { rec('runs as non-root', process.getuid() !== 0, 'uid=' + process.getuid()); } catch (e) { rec('runs as non-root', false, code(e)); }
-try { fs.writeFileSync('/probe', 'x'); rec('root filesystem is read-only', false, 'write to / succeeded'); } catch (e) { rec('root filesystem is read-only', true, code(e)); }
+// Checked from mount options, not a write attempt: as a non-root user a write to /
+// fails with EACCES regardless, which would say nothing about --read-only.
+try {
+  const root = fs.readFileSync('/proc/mounts', 'utf8').split(String.fromCharCode(10)).map((l) => l.split(' ')).find((f) => f[1] === '/');
+  const opts = root ? root[3].split(',') : [];
+  rec('root filesystem is mounted read-only', opts.includes('ro'), root ? root.join(' ') : 'no / entry in /proc/mounts');
+} catch (e) { rec('root filesystem is mounted read-only', false, code(e)); }
 try { fs.writeFileSync('/app/probe', 'x'); rec('app directory is not writable', false, 'write to /app succeeded'); } catch (e) { rec('app directory is not writable', true, code(e)); }
 try { fs.writeFileSync('/tmp/probe', 'x'); rec('scratch tmpfs is writable', true, '/tmp ok'); } catch (e) { rec('scratch tmpfs is writable', false, code(e)); }
 
@@ -301,9 +307,9 @@ try {
 
 try {
   const v = fs.readFileSync('/proc/version', 'utf8');
-  // gVisor reports a synthetic kernel version rather than the host's.
-  rec('kernel is gVisor (heuristic: synthetic /proc/version)', /4\\.4\\.0/.test(v), v.trim());
-} catch (e) { rec('kernel is gVisor (heuristic: synthetic /proc/version)', false, code(e)); }
+  // gVisor reports a synthetic kernel whose version string names it.
+  rec('kernel is gVisor', /gvisor/i.test(v), v.trim());
+} catch (e) { rec('kernel is gVisor', false, code(e)); }
 
 let pending = 2;
 const done = () => { if (--pending === 0) { console.log(JSON.stringify(results)); process.exit(0); } };
