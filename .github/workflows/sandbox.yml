@@ -64,12 +64,12 @@ jobs:
       - name: Preflight
         run: node dist/src/cli.js preflight --runner docker
 
-      - name: Diagnose seccomp / runtime matrix
-        continue-on-error: true
-        run: bash scripts/diagnose-seccomp.sh
-
       - name: Verify isolation from inside the container
         run: node dist/src/cli.js verify-isolation
+
+      - name: Diagnose seccomp / runtime matrix (only if isolation checks failed)
+        if: failure()
+        run: bash scripts/diagnose-seccomp.sh
 
       - name: Example - well-behaved submission
         run: node dist/src/cli.js run --source examples/slugify.ts --tests examples/slugify.tests.json

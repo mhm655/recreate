@@ -11,9 +11,8 @@ TMP=$(mktemp -d)
 
 # Relaxed variants of the profile, each changing exactly one rule.
 jq '(.syscalls[] | select(.names == ["clone"])) |= del(.args)' "$PROFILE" > "$TMP/clone-unconditional.json"
-jq '(.syscalls[] | select(.names == ["clone3"])) |= (.action = "SCMP_ACT_ALLOW" | del(.errnoRet))' "$PROFILE" > "$TMP/clone3-allowed.json"
-jq '(.syscalls[] | select(.names == ["clone"])) |= del(.args)
-    | (.syscalls[] | select(.names == ["clone3"])) |= (.action = "SCMP_ACT_ALLOW" | del(.errnoRet))' "$PROFILE" > "$TMP/both-relaxed.json"
+# The rule that breaks node under gVisor: refusing clone3 with ENOSYS.
+jq '(.syscalls[] | select(.names == ["clone3"])) |= (.action = "SCMP_ACT_ERRNO" | .errnoRet = 38)' "$PROFILE" > "$TMP/clone3-enosys.json"
 jq '.defaultAction = "SCMP_ACT_ALLOW"' "$PROFILE" > "$TMP/default-allow.json"
 
 PROBE='const {Worker}=require("worker_threads");const w=new Worker("require(\"worker_threads\").parentPort.postMessage(1)",{eval:true});w.on("message",()=>{console.log("NODE+WORKER OK");process.exit(0)});w.on("error",e=>{console.log("WORKER ERROR "+e.message);process.exit(3)})'
@@ -39,8 +38,7 @@ for rt in runc runsc; do
   try "$rt  prod flags, docker default seccomp" --runtime "$rt" "${FLAGS[@]}"
   try "$rt  prod flags, OUR PROFILE"            --runtime "$rt" "${FLAGS[@]}" --security-opt "seccomp=$PROFILE"
   try "$rt  prod flags, profile: clone unconditional" --runtime "$rt" "${FLAGS[@]}" --security-opt "seccomp=$TMP/clone-unconditional.json"
-  try "$rt  prod flags, profile: clone3 allowed"      --runtime "$rt" "${FLAGS[@]}" --security-opt "seccomp=$TMP/clone3-allowed.json"
-  try "$rt  prod flags, profile: both relaxed"        --runtime "$rt" "${FLAGS[@]}" --security-opt "seccomp=$TMP/both-relaxed.json"
+  try "$rt  prod flags, profile: clone3 -> ENOSYS"    --runtime "$rt" "${FLAGS[@]}" --security-opt "seccomp=$TMP/clone3-enosys.json"
   try "$rt  prod flags, profile: defaultAction ALLOW" --runtime "$rt" "${FLAGS[@]}" --security-opt "seccomp=$TMP/default-allow.json"
   echo
 done
