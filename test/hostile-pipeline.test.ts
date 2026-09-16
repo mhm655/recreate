@@ -466,6 +466,34 @@ describe('vendored dependencies', () => {
   });
 });
 
+describe('function and class-instance arguments', () => {
+  const CALLS_ITS_CALLBACK = `
+    export function callIt(cb: (x: number) => number): number {
+      return cb(41);
+    }
+  `;
+
+  it('a submission that actually calls a function argument gets a loud, attributable failure', async () => {
+    const report = await run(CALLS_ITS_CALLBACK, [{ id: 't', args: [(x: number) => x + 1] }]);
+    assert.equal(report.verdict, 'ok', explain(report));
+    const outcome = report.results.t.outcome as { type: string; errorClass: string; message: string };
+    assert.equal(outcome.type, 'thrown');
+    assert.match(outcome.message, /cannot be reconstructed/);
+  });
+
+  const IGNORES_ITS_CALLBACK = `
+    export function ignoresIt(_cb: () => number): string {
+      return 'fine';
+    }
+  `;
+
+  it('a submission that never calls its function argument is unaffected', async () => {
+    const report = await run(IGNORES_ITS_CALLBACK, [{ id: 't', args: [() => 1] }]);
+    assert.equal(report.verdict, 'ok', explain(report));
+    assert.equal(returned(report.results.t), 'fine');
+  });
+});
+
 describe('reconciliation edge cases (synthetic channel data)', () => {
   const limits = DEFAULT_LIMITS;
   const ok = (resultChannel: string, over: Partial<RunnerResult> = {}): RunnerResult => ({

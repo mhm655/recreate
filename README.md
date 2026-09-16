@@ -298,10 +298,7 @@ Decided (2026-09-16):
 4. **Inputs on which the original times out are dropped** during generation instead of being kept as expected timeouts.
 
 5. **Real dependencies are supported through host-side bundling, not a runtime resolver.** A short vetted list (`VENDORED_MODULES`, currently `lodash-es`) is inlined into the transpiled submission by esbuild before it reaches the worker, so the sandbox still ships no `node_modules` and `require` still throws in the realm. See "Vendored dependencies" above. Extending the list is a per-package vetting decision, not a mechanism change.
-
-Still open:
-
-6. **Callbacks and class instances as arguments.** Functions decode to inert placeholders, and class instances decode to plain objects (the constructor name is recorded). The analyzer reports such parameters as blockers, or as always omitted when they're optional.
+6. **Functions and class instances stay permanently unsupported as argument *values*,** not just unimplemented -- there is no channel for the sandbox to call back out to a real function on the other side of the boundary, and reconstructing a class instance without its methods would just be a plain object with a label. The analyzer already reports these as blockers (or omits them when optional) so the not-yet-built input generator never has to produce one. What changed here: a decoded function argument used to be a silent no-op, so a submission that actually *called* a callback argument got a plausible-looking `undefined` back -- indistinguishable from a callback that legitimately returned nothing. It now throws a labelled error on call, turning that into a loud, attributable failure of the call instead of a wrong answer that looks right. Class instances still decode to plain objects with `ctor` recorded (unchanged); a submission that calls a method the plain object doesn't have already fails loudly for the same reason.
 
 ---
 

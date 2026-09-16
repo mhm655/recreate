@@ -554,8 +554,19 @@ class Decoder {
       case 'symbol':
         return Symbol(enc.v);
       case 'fn': {
+        // Functions cannot be passed into the sandbox (see README, "Decisions for
+        // the next layers" #6): there is no channel to call back out to whatever
+        // real function the original argument was. A no-op placeholder would let a
+        // submission that actually invokes a callback argument silently get
+        // `undefined` back and carry on -- indistinguishable from a callback that
+        // legitimately returned nothing. Throwing on call instead turns that into a
+        // loud, attributable failure of the call, not a wrong answer.
         const name = typeof enc.name === 'string' ? enc.name : '';
-        const fn = function decodedFunctionPlaceholder() {};
+        const label = name ? `${enc.cls ? 'class' : 'function'} '${name}'` : `an anonymous ${enc.cls ? 'class' : 'function'}`;
+        const message = `${label} was passed as an argument but functions cannot be reconstructed inside the sandbox`;
+        const fn = function decodedFunctionPlaceholder(): never {
+          throw new R.Error(message);
+        };
         try {
           Object.defineProperty(fn, 'name', { value: name });
         } catch {

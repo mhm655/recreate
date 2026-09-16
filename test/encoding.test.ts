@@ -139,6 +139,18 @@ describe('encoding: primitives and built-ins', () => {
     assert.deepEqual(enc, { t: 'fn', i: 0, name: 'namedThing', cls: false });
     assert.equal((encode(class K {}) as any).cls, true);
   });
+
+  it('decodes a function to a placeholder that throws when called, not a silent no-op', () => {
+    const decoded = decode(encode(function namedThing() {})) as (...a: unknown[]) => unknown;
+    assert.equal(typeof decoded, 'function');
+    assert.equal(decoded.name, 'namedThing');
+    assert.throws(() => decoded(), /namedThing.*cannot be reconstructed/);
+  });
+
+  it('a decoded class placeholder also throws, including when called with `new`', () => {
+    const decoded = decode(encode(class Widget {})) as new (...a: unknown[]) => unknown;
+    assert.throws(() => new decoded(), /Widget.*cannot be reconstructed/);
+  });
 });
 
 describe('encoding: errors', () => {
