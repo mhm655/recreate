@@ -6,7 +6,7 @@ The execution layer of a larger tool. That tool captures a real TypeScript funct
 
 This repo is **only** the sandbox and execution harness. It takes a function and a list of inputs, runs the function once per input inside an isolated sandbox, and returns each result in a lossless tagged encoding. Every failure comes back as a structured report, never as a crash or a hang of the calling process.
 
-Out of scope here: AST analysis, LLM test generation, mutation testing, the challenge data model, the UI.
+Also here: the static analyzer that describes a function's parameters for input generation. Not built yet: input generation, the evaluator, mutation testing, the challenge data model, the UI.
 
 ---
 
@@ -180,6 +180,28 @@ The container memory limit sits above the RSS watchdog, and the watchdog above t
 
 ---
 
+## Static analyzer
+
+`tsbox analyze` describes the function under test for the input generator. It runs on the host and **never executes the source**.
+
+```bash
+node dist/src/cli.js analyze --source examples/slugify.ts          # summary
+node dist/src/cli.js analyze --source examples/slugify.ts --json   # full FunctionAnalysis
+```
+
+- **Types come from the TypeScript checker,** not from reading annotations as text. So aliases, interfaces, enums, generic constraints, utility types (`Partial`, `Pick`, `Record`), overloads, and types inferred from defaults (`limit = 48`) resolve the way the compiler sees them. Each parameter gets a JSON `TypeShape` (`src/analyzer/types.ts`) and keeps the checker's own rendering of the type in `text`.
+- **Generatability.** Parameters the generator can't produce are:
+  - *blockers* when required: callbacks, class instances, promises, generator functions;
+  - *always omitted* when optional;
+  - *weakly typed* when they're `any`, `unknown` or unconstrained generics.
+- **Nondeterminism.** It lists calls to `Date.now()`, `new Date()`, `Date()`, `Math.random()`, `performance.now()` and `crypto.*`, ignoring deterministic forms like `new Date(ms)` and local shadows.
+- **Module state.** It lists top-level bindings and containers that the function *writes to from inside a function body*: reassigned `let`s, `Map`/`Set`/array/object mutation. Read-only lookup tables and module initialisation aren't flagged. These are hints; the harness's two-pass run is the authoritative check.
+- **Same screening as the harness.** Analysis applies the import allowlist and the same entry-point rules, so it never describes a function the sandbox would refuse, or a different function from the one it would run.
+- **Can't read the disk.** The compiler host serves only the in-memory submission and TypeScript's ES2022 lib declarations. Even an allowlisted import comes back as an unresolved type; there's a test proving a real file on disk isn't read. There's no DOM or `@types/node`, matching the sandbox realm.
+- **Isolated.** The CLI uses `analyzeIsolated`, which runs the checker in a worker thread with a timeout and heap cap. TypeScript's type system is Turing-complete, so a hostile source can make the checker spin; this contains that.
+
+---
+
 ## Design notes
 
 ### Result channel
@@ -235,7 +257,7 @@ The tamper tests inject a `--require` preload into the sandbox process. It attac
 
 ### Verification status
 
-- **Windows 10 / Node 26:** all 109 tests via `LocalRunner`, plus the CLI paths.
+- **Windows 10 / Node 26:** the full suite via `LocalRunner`, plus the CLI paths.
 - **CI, GitHub Ubuntu runners with gVisor `release-20260907.0` and `--oci-seccomp`** ([workflow](.github/workflows/sandbox.yml)):
   - the full local suite;
   - `verify-isolation` from inside a production-flagged container: non-root, read-only root mount, no network egress (`EPERM`), process creation blocked (`EPERM`), worker threads working, gVisor kernel;
@@ -254,16 +276,19 @@ The tamper tests inject a `--require` preload into the sandbox process. It attac
 - **Node's `--permission` model was considered and rejected.** Worker threads need `--allow-worker`, which Node warns "could invalidate the permission model".
 - **Base images are tag-pinned, not digest-pinned.** Pin both `FROM` lines to `@sha256:` digests for production.
 
-## Open questions for the next layers
+## Decisions for the next layers
 
-These choices shape challenge generation and evaluation, so I haven't guessed at them here:
+Decided (2026-09-16):
 
-1. **What happens when the *original* function is order-sensitive?** It can't be an oracle as-is. Options: reject it, or add a per-test isolation mode (a fresh worker per test) that trades away state-leak detection for testability. The second is a small change to `WorkerSupervisor`.
-2. **Should `Date.now()` and `Math.random()` be frozen or seeded in the sandbox realm?** Both are currently live, so functions using them get flagged `nondeterministic`. That's accurate, but it rules those functions out as challenges.
-3. **How strictly should thrown errors be compared?** The harness records `errorClass` plus a *normalised* message. Evaluation needs to decide between class-only and class plus message.
-4. **Can a timeout on the original count as an expected outcome?** More likely, those inputs should be dropped during generation.
+1. **An order-sensitive original is rejected as an oracle,** with the divergences as the reason. A per-test fresh-worker mode is possible later if real functions need it.
+2. **Time and randomness will be frozen or seeded inside the sandbox realm,** so functions using `Date.now()` or `Math.random()` become testable. *Not implemented yet:* until then the analyzer lists these call sites and the harness flags such functions `nondeterministic`.
+3. **Thrown errors match on error class plus normalised message.** Class-only matching can be a per-challenge option.
+4. **Inputs on which the original times out are dropped** during generation instead of being kept as expected timeouts.
+
+Still open:
+
 5. **Real dependencies.** The allowlist is empty and `require` throws in the realm. Supporting e.g. `lodash-es` means vendoring vetted modules into the image and adding a resolver. Decide whether the MVP needs this.
-6. **Callbacks and class instances as arguments.** Functions decode to inert placeholders, and class instances decode to plain objects (the constructor name is recorded). So higher-order functions and methods relying on prototypes aren't testable yet.
+6. **Callbacks and class instances as arguments.** Functions decode to inert placeholders, and class instances decode to plain objects (the constructor name is recorded). The analyzer reports such parameters as blockers, or as always omitted when they're optional.
 
 ---
 
@@ -281,6 +306,7 @@ src/
   host/runner.ts       runner interface + LocalRunner (NO isolation)
   host/docker-runner.ts gVisor container runner + verify-isolation probes
   host/orchestrator.ts two passes, reconciliation, comparison, report
+  analyzer/            static signature/type analysis for input generation (host, no execution)
   cli.ts
 docker/Dockerfile, docker/seccomp.json
 scripts/check-sandbox.sh
