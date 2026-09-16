@@ -10,6 +10,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
+import { analyzeIsolated } from './analyzer/isolated';
+import type { FunctionAnalysis } from './analyzer/types';
 import { checkSource } from './import-guard';
 import { DockerRunner } from './host/docker-runner';
 import { LocalRunner, type SandboxRunner } from './host/runner';
@@ -22,6 +24,8 @@ tsbox -- sandboxed TypeScript execution harness
 
   tsbox run --source <file.ts> --tests <file.json> [options]
   tsbox check --source <file.ts> [--entry <name>]
+  tsbox analyze --source <file.ts> [--entry <name>] [--json]
+                                    static signature/type analysis (no execution)
   tsbox preflight [--runner docker|local]
   tsbox verify-isolation            probe the container's isolation from inside it
 
@@ -157,6 +161,39 @@ function limitsFrom(a: Args): Partial<Limits> {
 
 // --- rendering ------------------------------------------------------------
 
+function renderAnalysis(a: FunctionAnalysis): string {
+  const lines: string[] = [];
+  const prefix = `${a.isAsync ? 'async ' : ''}${a.isGenerator ? 'function* ' : ''}`;
+  for (const sig of a.signatures) {
+    const tps = sig.typeParameters.length ? `<${sig.typeParameters.join(', ')}>` : '';
+    const params = sig.params
+      .map((p) => `${p.rest ? '...' : ''}${p.name}${p.optional ? '?' : ''}: ${p.type.text}${p.defaultText ? ` = ${p.defaultText}` : ''}`)
+      .join(', ');
+    lines.push(`${prefix}${a.entryName}${tps}(${params}): ${sig.returnType.text}`);
+  }
+  if (a.signatures.length > 1) lines.push(`  (${a.signatures.length} overloads)`);
+
+  const g = a.generatability;
+  lines.push('', `generatable : ${g.generatable ? 'yes' : 'NO'}`);
+  for (const b of g.blockers) lines.push(`  ! ${b}`);
+  if (g.omitted.length) lines.push(`  always omitted: ${g.omitted.join('; ')}`);
+  if (g.weaklyTyped.length) lines.push(`  weakly typed: ${g.weaklyTyped.join('; ')}`);
+
+  if (a.nondeterminism.length) {
+    lines.push('', 'time / randomness (results vary between runs):');
+    for (const n of a.nondeterminism) lines.push(`  line ${n.line}:${n.column}  ${n.kind}  ${n.snippet}`);
+  }
+  if (a.moduleState.length) {
+    lines.push('', 'module-level state written by the function (likely order-sensitive):');
+    for (const s of a.moduleState) lines.push(`  line ${s.line}:${s.column}  ${s.name} (${s.reason})`);
+  }
+  if (a.typeErrors.length) {
+    lines.push('', 'type errors (reported types may be unreliable):');
+    for (const e of a.typeErrors) lines.push(`  ${e}`);
+  }
+  return lines.join('\n');
+}
+
 function render(report: SubmissionReport): string {
   const lines: string[] = [];
   const mark = { ok: 'PASS', rejected: 'REJECTED', nondeterministic: 'NON-DETERMINISTIC', failed: 'FAILED' };
@@ -256,6 +293,24 @@ async function main(): Promise<number> {
   const sourcePath = one(args, 'source');
   if (!sourcePath) throw new Error('--source is required');
   const source = fs.readFileSync(path.resolve(sourcePath), 'utf8');
+
+  if (args.command === 'analyze') {
+    const result = await analyzeIsolated(source, {
+      entryName: one(args, 'entry'),
+      allowedModules: args.flags.get('allow'),
+    });
+    if (has(args, 'json')) {
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } else if (!result.ok) {
+      for (const e of result.errors) {
+        const where = e.line ? ` (line ${e.line}:${e.column})` : '';
+        process.stdout.write(`REJECTED [${e.code}]${where} ${e.message}\n`);
+      }
+    } else {
+      process.stdout.write(`${renderAnalysis(result.analysis)}\n`);
+    }
+    return result.ok ? 0 : 1;
+  }
 
   if (args.command === 'check') {
     const guard = checkSource(source, {
