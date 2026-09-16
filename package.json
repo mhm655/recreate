@@ -1,0 +1,30 @@
+{
+  "name": "ts-sandbox-harness",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Two-layer sandbox (gVisor container + worker thread) for executing untrusted TypeScript functions against a fixed test-input list.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "dist/src/index.js",
+  "bin": {
+    "tsbox": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "test:unit": "npm run build && node --test dist/test/encoding.test.js dist/test/import-guard.test.js",
+    "test:hostile": "npm run build && node --test dist/test/hostile-pipeline.test.js",
+    "image": "docker build -f docker/Dockerfile -t ts-sandbox-harness:latest .",
+    "check:host": "bash scripts/check-sandbox.sh",
+    "tsbox": "node dist/src/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0"
+  },
+  "dependencies": {
+    "typescript": "^5.6.3"
+  }
+}

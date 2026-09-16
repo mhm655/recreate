@@ -1,0 +1,7 @@
+node_modules
+dist
+.git
+test
+docker
+scripts
+README.md
