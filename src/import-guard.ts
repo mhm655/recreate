@@ -34,6 +34,16 @@ import * as ts from 'typescript';
  *
  * Entries are matched exactly. Subpaths are not implied: allowing 'lodash-es' does
  * not allow 'lodash-es/fp'. There is no wildcard support, on purpose.
+ *
+ * An allowed specifier still needs to be *satisfiable* at runtime: see
+ * src/bundle.ts, which inlines VENDORED_MODULES into the submission on the host so
+ * the sandbox never has to `require` anything real. Allowing a module here without
+ * vendoring it there means static analysis passes but bundling rejects it.
+ *
+ * This module's own default stays empty on purpose -- `checkSource` is usable
+ * standalone, and a conservative default is the right one for a generic caller.
+ * `evaluate()` in src/host/orchestrator.ts is the harness entry point that actually
+ * grades submissions, and it defaults `allowedModules` to `VENDORED_MODULES` instead.
  */
 export const DEFAULT_ALLOWED_MODULES: readonly string[] = [];
 

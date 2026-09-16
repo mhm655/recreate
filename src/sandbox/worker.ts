@@ -156,6 +156,14 @@ function compile(): Compiled {
     },
   });
 
+  // Alias `global` to this context's own globalThis, matching the one thing real
+  // Node CJS modules would otherwise see. Without it, a vendored CommonJS
+  // dependency (see src/bundle.ts) that probes `typeof global` and falls through to
+  // `Function('return this')()` -- lodash-es does exactly this -- hits the disabled
+  // string-code-generation guard below and throws. This adds no capability: `global`
+  // here is the same restricted, freshly-captured realm as `globalThis`, not Node's.
+  vm.runInContext('globalThis.global = globalThis', context);
+
   // Snapshot intrinsics NOW, before any untrusted code runs, so that a later
   // `globalThis.Array = attacker` cannot influence how arguments are constructed.
   const realm = captureRealm(vm.runInContext('globalThis', context));

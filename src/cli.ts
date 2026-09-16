@@ -13,6 +13,7 @@ import * as path from 'node:path';
 import { analyzeIsolated } from './analyzer/isolated';
 import type { FunctionAnalysis } from './analyzer/types';
 import { checkSource } from './import-guard';
+import { VENDORED_MODULES } from './bundle';
 import { DockerRunner } from './host/docker-runner';
 import { LocalRunner, type SandboxRunner } from './host/runner';
 import { evaluate, type SubmissionReport } from './host/orchestrator';
@@ -297,7 +298,7 @@ async function main(): Promise<number> {
   if (args.command === 'analyze') {
     const result = await analyzeIsolated(source, {
       entryName: one(args, 'entry'),
-      allowedModules: args.flags.get('allow'),
+      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
     });
     if (has(args, 'json')) {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -315,7 +316,7 @@ async function main(): Promise<number> {
   if (args.command === 'check') {
     const guard = checkSource(source, {
       entryName: one(args, 'entry'),
-      allowedModules: args.flags.get('allow'),
+      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
     });
     if (guard.ok) {
       process.stdout.write(`OK  entry='${guard.entryName}'  modules=[${guard.referencedModules.join(', ')}]\n`);
@@ -338,7 +339,7 @@ async function main(): Promise<number> {
     source,
     tests,
     entryName: one(args, 'entry') ?? entryName,
-    allowedModules: args.flags.get('allow'),
+    allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
     limits: limitsFrom(args),
     runner: buildRunner(args),
     seed: num(args, 'seed'),

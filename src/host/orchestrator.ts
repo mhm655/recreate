@@ -35,6 +35,7 @@ import {
 } from '../protocol';
 import { newResultKey } from '../channel';
 import { transpileSubmission } from '../transpile';
+import { bundleSubmission, VENDORED_MODULES } from '../bundle';
 import type { RunnerResult, SandboxRunner } from './runner';
 
 export interface TestCase {
@@ -152,7 +153,7 @@ export async function evaluate(options: EvaluateOptions): Promise<SubmissionRepo
 
   // --- static screening, before a container exists -------------------------
   const guard = checkSource(options.source, {
-    allowedModules: options.allowedModules,
+    allowedModules: options.allowedModules ?? VENDORED_MODULES,
     entryName: options.entryName,
     skipGlobalHeuristics: options.skipGlobalHeuristics,
   });
@@ -180,6 +181,17 @@ export async function evaluate(options: EvaluateOptions): Promise<SubmissionRepo
     referencedModules: guard.referencedModules,
   };
 
+  // Inline any vendored dependency (e.g. lodash-es) so the code handed to the worker
+  // is once again self-contained and requires nothing at runtime. No-op when the
+  // submission has no imports.
+  const bundled = await bundleSubmission(transpiled.code, guard.referencedModules);
+  if (!bundled.ok) {
+    return base('rejected', {
+      staticAnalysis,
+      problems: [{ code: 'bundle_failed', detail: bundled.detail }],
+    });
+  }
+
   // --- encode arguments once, reuse for both passes ------------------------
   let encodedTests: TestInput[];
   try {
@@ -205,7 +217,7 @@ export async function evaluate(options: EvaluateOptions): Promise<SubmissionRepo
   // --- pass A: original order ---------------------------------------------
   const passA = await runPass({
     runId, passId: 'a', tests: encodedTests, entryName: guard.entryName,
-    code: transpiled.code, limits, runner, hostTimeoutMs: perPassHostTimeout,
+    code: bundled.code, limits, runner, hostTimeoutMs: perPassHostTimeout,
   });
 
   // --- pass B: shuffled order, fresh container, fresh worker ---------------
@@ -225,7 +237,7 @@ export async function evaluate(options: EvaluateOptions): Promise<SubmissionRepo
   const shuffled = shuffle(encodedTests, seed);
   const passB = await runPass({
     runId, passId: 'b', tests: shuffled, entryName: guard.entryName,
-    code: transpiled.code, limits, runner,
+    code: bundled.code, limits, runner,
     hostTimeoutMs: Math.min(perPassHostTimeout, remaining),
   });
 

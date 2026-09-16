@@ -440,6 +440,32 @@ describe('hostile: writes straight to the result fd', { skip: USE_DOCKER && 'tam
 
 // ---------------------------------------------------------------------------
 
+describe('vendored dependencies', () => {
+  const LODASH_CHUNK = `
+    import { chunk } from 'lodash-es';
+    export function firstPair(xs: number[]): number[] {
+      return chunk(xs, 2)[0] ?? [];
+    }
+  `;
+
+  it('runs a submission that imports a vendored module, end to end', async () => {
+    const report = await run(LODASH_CHUNK, [
+      { id: 'basic', args: [[1, 2, 3, 4]] },
+      { id: 'empty', args: [[]] },
+    ]);
+    assert.equal(report.verdict, 'ok', explain(report));
+    assert.deepEqual(returned(report.results.basic), [1, 2]);
+    assert.deepEqual(returned(report.results.empty), []);
+  });
+
+  it('still rejects an import that is neither allowlisted nor vendored', async () => {
+    const report = await run("import { z } from 'left-pad'; export function f() { return z; }", [
+      { id: 't', args: [] },
+    ]);
+    assert.equal(report.verdict, 'rejected', explain(report));
+  });
+});
+
 describe('reconciliation edge cases (synthetic channel data)', () => {
   const limits = DEFAULT_LIMITS;
   const ok = (resultChannel: string, over: Partial<RunnerResult> = {}): RunnerResult => ({
