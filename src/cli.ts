@@ -14,6 +14,7 @@ import { analyzeIsolated } from './analyzer/isolated';
 import type { FunctionAnalysis } from './analyzer/types';
 import { checkSource } from './import-guard';
 import { VENDORED_MODULES } from './bundle';
+import { generateTests } from './generator/generate';
 import { DockerRunner } from './host/docker-runner';
 import { LocalRunner, type SandboxRunner } from './host/runner';
 import { evaluate, type SubmissionReport } from './host/orchestrator';
@@ -27,6 +28,11 @@ tsbox -- sandboxed TypeScript execution harness
   tsbox check --source <file.ts> [--entry <name>]
   tsbox analyze --source <file.ts> [--entry <name>] [--json]
                                     static signature/type analysis (no execution)
+  tsbox generate --source <file.ts> [--entry <name>] [--seed <n>] [--max-tests <n>]
+                 [--json] [--out <file.json>]
+                                    generate a test-input suite for the function
+                                    (see "Static analyzer" / "Input generation" in
+                                    README.md); prints a summary unless --json/--out
   tsbox preflight [--runner docker|local]
   tsbox verify-isolation            probe the container's isolation from inside it
 
@@ -253,6 +259,56 @@ function summarize(outcome: SubmissionReport['passes'][number]['results'][number
   }
 }
 
+// --- generate: plain-JSON conversion ---------------------------------------
+
+function sentinelForSpecialNumber(n: number): string | undefined {
+  if (Number.isNaN(n)) return '@@NaN';
+  if (n === Infinity) return '@@Infinity';
+  if (n === -Infinity) return '@@-Infinity';
+  if (Object.is(n, -0)) return '@@-0';
+  return undefined;
+}
+
+/**
+ * Converts one generated argument into the plain-JSON `--tests` format (see USAGE).
+ * That format only round-trips what `liftSentinels` understands: primitives, plain
+ * arrays/objects, and the four sentinel-able numeric specials plus `undefined`.
+ * `Date`, `Map`, `Set`, `RegExp`, typed arrays and `bigint` -- all things the
+ * generator can legitimately produce -- have no representation there, so this
+ * reports failure instead of silently writing something misleading; the caller
+ * skips that test and points at the JS API (`generateTests` + `evaluate()`) instead.
+ */
+function toCliJson(value: unknown): { ok: true; json: unknown } | { ok: false } {
+  if (value === undefined) return { ok: true, json: '@@undefined' };
+  if (value === null) return { ok: true, json: null };
+  const t = typeof value;
+  if (t === 'boolean') return { ok: true, json: value };
+  if (t === 'number') {
+    const s = sentinelForSpecialNumber(value as number);
+    return { ok: true, json: s ?? value };
+  }
+  if (t === 'string') return { ok: true, json: (value as string).startsWith('@@') ? `@@${value}` : value };
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    for (const el of value) {
+      const r = toCliJson(el);
+      if (!r.ok) return r;
+      out.push(r.json);
+    }
+    return { ok: true, json: out };
+  }
+  if (t === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const r = toCliJson(v);
+      if (!r.ok) return r;
+      out[k] = r.json;
+    }
+    return { ok: true, json: out };
+  }
+  return { ok: false };
+}
+
 // --- commands -------------------------------------------------------------
 
 async function main(): Promise<number> {
@@ -311,6 +367,64 @@ async function main(): Promise<number> {
       process.stdout.write(`${renderAnalysis(result.analysis)}\n`);
     }
     return result.ok ? 0 : 1;
+  }
+
+  if (args.command === 'generate') {
+    const analyzed = await analyzeIsolated(source, {
+      entryName: one(args, 'entry'),
+      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+    });
+    if (!analyzed.ok) {
+      for (const e of analyzed.errors) {
+        const where = e.line ? ` (line ${e.line}:${e.column})` : '';
+        process.stdout.write(`REJECTED [${e.code}]${where} ${e.message}\n`);
+      }
+      return 1;
+    }
+
+    const generated = generateTests(analyzed.analysis, {
+      seed: num(args, 'seed'),
+      maxTests: num(args, 'max-tests'),
+    });
+    if (!generated.ok) {
+      process.stdout.write(`cannot generate inputs: ${generated.reason}\n`);
+      return 1;
+    }
+
+    const testsOut: TestCase[] = [];
+    const skipped: string[] = [];
+    for (const t of generated.tests) {
+      const converted: unknown[] = [];
+      let ok = true;
+      for (const a of t.args) {
+        const r = toCliJson(a);
+        if (!r.ok) { ok = false; break; }
+        converted.push(r.json);
+      }
+      if (ok) testsOut.push({ id: t.id, args: converted });
+      else skipped.push(t.id);
+    }
+
+    const payload = { entryName: generated.entryName, tests: testsOut };
+    const outPath = one(args, 'out');
+    if (outPath) {
+      fs.writeFileSync(path.resolve(outPath), `${JSON.stringify(payload, null, 2)}\n`);
+    }
+    if (has(args, 'json') && !outPath) {
+      process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    } else if (!outPath) {
+      process.stdout.write(`generated ${testsOut.length} test(s) for '${generated.entryName}'\n`);
+      for (const t of testsOut) process.stdout.write(`  ${t.id.padEnd(24)} ${JSON.stringify(t.args)}\n`);
+    }
+    if (skipped.length) {
+      process.stdout.write(
+        `\n${skipped.length} generated test(s) use a value with no plain-JSON representation ` +
+          `(Date/Map/Set/RegExp/typed array/bigint) and were left out of the file: ${skipped.join(', ')}\n` +
+          `Use the JS API (generateTests + evaluate) to run those directly.\n`,
+      );
+    }
+    if (outPath) process.stdout.write(`wrote ${testsOut.length} test(s) to ${outPath}\n`);
+    return 0;
   }
 
   if (args.command === 'check') {

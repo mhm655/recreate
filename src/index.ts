@@ -14,3 +14,4 @@ export type { SandboxRunner, RunnerResult } from './host/runner';
 export { DockerRunner } from './host/docker-runner';
 export type { DockerRunnerOptions } from './host/docker-runner';
 export * from './analyzer';
+export * from './generator';

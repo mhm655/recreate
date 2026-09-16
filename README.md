@@ -6,7 +6,7 @@ The execution layer of a larger tool. That tool captures a real TypeScript funct
 
 This repo is **only** the sandbox and execution harness. It takes a function and a list of inputs, runs the function once per input inside an isolated sandbox, and returns each result in a lossless tagged encoding. Every failure comes back as a structured report, never as a crash or a hang of the calling process.
 
-Also here: the static analyzer that describes a function's parameters for input generation. Not built yet: input generation, the evaluator, mutation testing, the challenge data model, the UI.
+Also here: the static analyzer that describes a function's parameters, and a basic input generator built on top of it. Not built yet: the evaluator, mutation testing, the challenge data model, the UI.
 
 ---
 
@@ -202,6 +202,24 @@ node dist/src/cli.js analyze --source examples/slugify.ts --json   # full Functi
 
 ---
 
+## Input generation
+
+`src/generator/` turns a `FunctionAnalysis` into test inputs for `evaluate()`. It runs on the host, reads only the analyzer's structural output, and never executes the original or the submission.
+
+```bash
+node dist/src/cli.js generate --source examples/slugify.ts --seed 5              # summary
+node dist/src/cli.js generate --source examples/slugify.ts --json               # {entryName, tests}
+node dist/src/cli.js generate --source examples/slugify.ts --out tests.json     # feed straight into `run --tests`
+```
+
+- **One-at-a-time, not a cross product.** For `n` parameters with a handful of representative values each, trying every combination is `prod(|values|)` -- unusable past two or three parameters. The generator instead fixes every parameter at one "typical" value and sweeps one parameter at a time through its whole value set, giving `sum(|values|)` tests. It also emits a `minimal` call with trailing optional arguments omitted, and, for a rest parameter, calls with zero/one/several extra arguments. This deliberately does not test interactions between two edge cases in different parameters -- this is a fixed-suite oracle grader, not a fuzzer; the harness's ordered/shuffled double run is what actually proves a submission, not the size of the suite.
+- **Values are edge-first.** `valuesFor` (`src/generator/values.ts`) returns things like `''`, long strings, `0`, negative numbers, `NaN`/`Infinity`/`-Infinity`, empty/singleton containers, and an invalid `Date`, not just one "normal" example -- the point of a fixed suite is to catch a rewrite that only handles the easy inputs.
+- **Deterministic.** A seeded PRNG (`src/generator/rng.ts`) drives every choice, so the same source and seed always produce the same suite.
+- **Refuses exactly what the analyzer would refuse.** `generateTests` checks `generatability.generatable` up front and returns the blockers as the reason, never attempting to fabricate a callback, a `Promise`, or a class instance. A shape the analyzer marks merely weak (`any`, `unknown`, an unconstrained generic, or `recursive`, its own cut-off marker for a self-referential type) gets a small set of generic fallback values instead of being refused -- refusing there would silently narrow what the harness can grade beyond what the analyzer itself decided.
+- **The CLI's plain-JSON test format is a strict subset of what the generator can produce.** `--tests` files (see Usage) only round-trip primitives, plain arrays/objects, and the four numeric-sentinel specials. `Date`, `Map`, `Set`, `RegExp`, typed arrays and `bigint` -- all things a real signature can legitimately require -- have no representation there. `tsbox generate` reports and skips any test that needs one rather than writing something that looks valid but isn't; call `generateTests` + `evaluate()` directly from the JS API to run those.
+
+---
+
 ## Design notes
 
 ### Result channel
@@ -318,6 +336,7 @@ src/
   host/docker-runner.ts gVisor container runner + verify-isolation probes
   host/orchestrator.ts two passes, reconciliation, comparison, report
   analyzer/            static signature/type analysis for input generation (host, no execution)
+  generator/           input generation from FunctionAnalysis (host, no execution)
   cli.ts
 docker/Dockerfile, docker/seccomp.json
 scripts/check-sandbox.sh
