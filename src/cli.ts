@@ -17,6 +17,9 @@ import { VENDORED_MODULES } from './bundle';
 import { generateTests } from './generator/generate';
 import { gradeSubmission, type GradeReport } from './evaluator/grade';
 import { runMutationTests, type MutationTestReport } from './mutator/mutation-test';
+import { captureChallenge } from './challenge/capture';
+import { gradeAgainstChallenge, type ChallengeGradeReport } from './challenge/grade';
+import type { Challenge } from './challenge/types';
 import { DockerRunner } from './host/docker-runner';
 import { LocalRunner, type SandboxRunner } from './host/runner';
 import { evaluate, type SubmissionReport } from './host/orchestrator';
@@ -36,14 +39,22 @@ tsbox -- sandboxed TypeScript execution harness
                                     (see "Static analyzer" / "Input generation" in
                                     README.md); prints a summary unless --json/--out
   tsbox grade --oracle <file.ts> --rewrite <file.ts> --tests <file.json> [options]
-                                    grade a rewrite against a captured oracle,
-                                    using the same tests against both (see
-                                    "Evaluator" in README.md); --tests may be a
+  tsbox grade --challenge <file.json> --rewrite <file.ts> [options]
+                                    grade a rewrite against a captured oracle, or
+                                    against a Challenge tsbox capture wrote (no
+                                    oracle source needed in that case); see
+                                    "Evaluator" in README.md. --tests may be a
                                     file 'generate --out' produced, or hand-written
   tsbox mutate --source <file.ts> --tests <file.json> [--max-mutants <n>] [--json]
                                     mutation-test a suite against its own oracle:
                                     is it strong enough to catch a wrong rewrite?
                                     (see "Mutation testing" in README.md)
+  tsbox capture --source <file.ts> [--entry <name>] [--seed <n>] [--max-tests <n>]
+                [--mutate] [--max-mutants <n>] [--json] [--out <file.json>]
+                                    capture the function's behaviour as a fixed,
+                                    self-contained Challenge (see "Challenge data
+                                    model" in README.md); --mutate also records a
+                                    mutation-testing summary on the challenge
   tsbox preflight [--runner docker|local]
   tsbox verify-isolation            probe the container's isolation from inside it
 
@@ -307,6 +318,34 @@ function renderMutation(report: MutationTestReport): string {
   return lines.join('\n');
 }
 
+function renderChallengeGrade(report: ChallengeGradeReport): string {
+  const lines: string[] = [];
+  const mark = { passed: 'PASSED', failed: 'FAILED', rewrite_invalid: 'REWRITE INVALID' };
+  lines.push(`verdict : ${mark[report.verdict]}`);
+  lines.push(`score   : ${(report.score * 100).toFixed(1)}% (${report.tests.filter((t) => t.result === 'match').length}/${report.tests.length})`);
+  for (const p of report.problems) lines.push(`  ! ${p.code}: ${p.detail}`);
+  for (const t of report.tests) {
+    if (t.result === 'match') continue;
+    lines.push(`  MISMATCH ${t.testId}: ${t.reason}`);
+    lines.push(`      expected: ${summarize(t.expected)}`);
+    lines.push(`      rewrite : ${summarize(t.rewrite)}`);
+  }
+  return lines.join('\n');
+}
+
+function renderChallengeSummary(challenge: Challenge): string {
+  const lines: string[] = [];
+  lines.push(`challenge '${challenge.id}' for '${challenge.entryName}'`);
+  lines.push(`  tests   : ${challenge.tests.length}`);
+  if (challenge.droppedTestIds.length) lines.push(`  dropped : ${challenge.droppedTestIds.length} (oracle timed out): ${challenge.droppedTestIds.join(', ')}`);
+  if (challenge.mutationTesting) {
+    const m = challenge.mutationTesting;
+    lines.push(`  mutation score : ${m.mutationScore === undefined ? 'n/a' : `${(m.mutationScore * 100).toFixed(1)}%`} (${m.killedCount} killed / ${m.killedCount + m.survivedCount} scoreable)`);
+    for (const s of m.survived) lines.push(`    SURVIVED (line ${s.line}:${s.column}): ${s.description}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
 // --- generate: plain-JSON conversion ---------------------------------------
 
 function sentinelForSpecialNumber(n: number): string | undefined {
@@ -396,15 +435,31 @@ async function main(): Promise<number> {
   }
 
   if (args.command === 'grade') {
-    const oraclePath = one(args, 'oracle');
     const rewritePath = one(args, 'rewrite');
-    const testsPath = one(args, 'tests');
-    if (!oraclePath) throw new Error('--oracle is required');
     if (!rewritePath) throw new Error('--rewrite is required');
+    const rewriteSource = fs.readFileSync(path.resolve(rewritePath), 'utf8');
+
+    const challengePath = one(args, 'challenge');
+    if (challengePath) {
+      const challenge = JSON.parse(fs.readFileSync(path.resolve(challengePath), 'utf8')) as Challenge;
+      const report = await gradeAgainstChallenge(challenge, {
+        rewriteSource,
+        entryName: one(args, 'entry'),
+        allowedModules: args.flags.get('allow'),
+        limits: limitsFrom(args),
+        runner: buildRunner(args),
+        seed: num(args, 'seed'),
+      });
+      process.stdout.write(has(args, 'json') ? `${JSON.stringify(report, null, 2)}\n` : `${renderChallengeGrade(report)}\n`);
+      return report.verdict === 'passed' ? 0 : 1;
+    }
+
+    const oraclePath = one(args, 'oracle');
+    const testsPath = one(args, 'tests');
+    if (!oraclePath) throw new Error('--oracle or --challenge is required');
     if (!testsPath) throw new Error('--tests is required');
 
     const oracleSource = fs.readFileSync(path.resolve(oraclePath), 'utf8');
-    const rewriteSource = fs.readFileSync(path.resolve(rewritePath), 'utf8');
     const { tests, entryName } = loadTests(path.resolve(testsPath));
 
     const report = await gradeSubmission({
@@ -420,6 +475,39 @@ async function main(): Promise<number> {
 
     process.stdout.write(has(args, 'json') ? `${JSON.stringify(report, null, 2)}\n` : `${renderGrade(report)}\n`);
     return report.verdict === 'passed' ? 0 : 1;
+  }
+
+  if (args.command === 'capture') {
+    const oraclePath = one(args, 'source');
+    if (!oraclePath) throw new Error('--source is required');
+    const oracleSource = fs.readFileSync(path.resolve(oraclePath), 'utf8');
+
+    const result = await captureChallenge({
+      oracleSource,
+      entryName: one(args, 'entry'),
+      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+      limits: limitsFrom(args),
+      runner: buildRunner(args),
+      seed: num(args, 'seed'),
+      maxTests: num(args, 'max-tests'),
+      mutationTest: has(args, 'mutate') ? { maxMutants: num(args, 'max-mutants'), seed: num(args, 'seed') } : false,
+    });
+
+    if (!result.ok) {
+      process.stdout.write(`cannot capture challenge: ${result.reason}\n`);
+      return 1;
+    }
+
+    const outPath = one(args, 'out');
+    if (outPath) {
+      fs.writeFileSync(path.resolve(outPath), `${JSON.stringify(result.challenge, null, 2)}\n`);
+      process.stdout.write(`wrote challenge '${result.challenge.id}' (${result.challenge.tests.length} test(s)) to ${outPath}\n`);
+    } else if (has(args, 'json')) {
+      process.stdout.write(`${JSON.stringify(result.challenge, null, 2)}\n`);
+    } else {
+      process.stdout.write(renderChallengeSummary(result.challenge));
+    }
+    return 0;
   }
 
   const sourcePath = one(args, 'source');

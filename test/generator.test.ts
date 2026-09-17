@@ -95,11 +95,15 @@ describe('generateTests', () => {
     assert.equal(b.ok, true);
   });
 
-  it('generates a no-args call for a zero-parameter function', async () => {
+  it('generates several no-args calls for a zero-parameter function, not just one', async () => {
     const analysis = await analysisOf('export function f(): number { return 1; }');
     const result = generateTests(analysis);
     assert.equal(result.ok, true);
-    if (result.ok) assert.deepEqual(result.tests, [{ id: 'no-args', args: [] }]);
+    if (!result.ok) return;
+    // More than one: a single call gives the harness's determinism check nothing to
+    // reorder, so a stateful zero-parameter function would always look pure.
+    assert.ok(result.tests.length > 1, JSON.stringify(result.tests));
+    for (const t of result.tests) assert.deepEqual(t.args, []);
   });
 
   it('produces both a call with the optional arg and one without it', async () => {

@@ -69,7 +69,12 @@ function compareOne(testId: string, oracle: TestResult, candidate: TestResult): 
   return { testId, result: 'mismatch', reason: mismatchReason(oracle.outcome, candidate.outcome), oracle, candidate };
 }
 
-function outcomesMatch(a: Outcome, b: Outcome): boolean {
+/**
+ * The matching rule itself, exported so a caller comparing against a frozen
+ * expected `Outcome` -- rather than a live oracle `SubmissionReport` -- doesn't have
+ * to duplicate it. See src/challenge/grade.ts.
+ */
+export function outcomesMatch(a: Outcome, b: Outcome): boolean {
   if (a.type !== b.type) return false;
   if (a.type === 'return') return canonical(a.value) === canonical((b as typeof a).value);
   if (a.type === 'thrown') {
@@ -86,7 +91,7 @@ function outcomesMatch(a: Outcome, b: Outcome): boolean {
   return false;
 }
 
-function mismatchReason(a: Outcome, b: Outcome): string {
+export function mismatchReason(a: Outcome, b: Outcome): string {
   if (a.type !== b.type) return `oracle ${a.type}, candidate ${b.type}`;
   if (a.type === 'return') return 'different return value';
   if (a.type === 'thrown') return 'different thrown error';

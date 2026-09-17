@@ -17,3 +17,4 @@ export * from './analyzer';
 export * from './generator';
 export * from './evaluator';
 export * from './mutator';
+export * from './challenge';

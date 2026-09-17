@@ -34,6 +34,8 @@ export type GenerateResult =
   | { ok: false; reason: string };
 
 const DEFAULT_MAX_TESTS = 60;
+/** How many identical no-argument calls to generate for a zero-parameter function; see generateForSignature. */
+const NO_ARG_CALL_COUNT = 3;
 
 export function generateTests(analysis: FunctionAnalysis, options: GenerateOptions = {}): GenerateResult {
   if (!analysis.generatability.generatable) {
@@ -62,7 +64,14 @@ function generateForSignature(sig: SignatureInfo, rng: Rng, budget: ValueBudget)
   const fixed = sig.params.filter((p) => !p.rest);
   const restParam = sig.params.find((p) => p.rest);
 
-  if (fixed.length === 0 && !restParam) return [{ id: 'no-args', args: [] }];
+  if (fixed.length === 0 && !restParam) {
+    // Several identical no-argument calls, not one. The harness's determinism
+    // check works by reordering multiple calls WITHIN one pass and comparing --
+    // with only a single call, there is nothing to reorder, so a function that
+    // carries state across calls (e.g. a module-level counter with no parameters
+    // to vary) would look deterministic no matter how stateful it actually is.
+    return Array.from({ length: NO_ARG_CALL_COUNT }, (_, i) => ({ id: `no-args-${i}`, args: [] }));
+  }
 
   const valueSets = fixed.map((p) => valuesFor(p.type, rng, budget));
   const typicalIndex = fixed.map((_p, i) => Math.min(Math.floor(valueSets[i].length / 2), valueSets[i].length - 1));

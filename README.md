@@ -6,7 +6,7 @@ The execution layer of a larger tool. That tool captures a real TypeScript funct
 
 This repo is **only** the sandbox and execution harness. It takes a function and a list of inputs, runs the function once per input inside an isolated sandbox, and returns each result in a lossless tagged encoding. Every failure comes back as a structured report, never as a crash or a hang of the calling process.
 
-Also here: the static analyzer that describes a function's parameters, a basic input generator built on top of it, the evaluator that grades a rewrite against a captured oracle using the same generated suite, and mutation testing, which checks whether a generated suite is actually strong enough to catch a wrong rewrite. Not built yet: the challenge data model, the UI.
+Also here: the static analyzer that describes a function's parameters, a basic input generator built on top of it, the evaluator that grades a rewrite against a captured oracle using the same generated suite, mutation testing (checks whether a generated suite is actually strong enough to catch a wrong rewrite), and the challenge data model that freezes all of that into a single, self-contained, JSON-safe artifact so grading never again needs the oracle's source. Not built yet: the UI.
 
 ---
 
@@ -254,6 +254,23 @@ node dist/src/cli.js mutate --source examples/slugify.ts --tests tests.json
 
 ---
 
+## Challenge data model
+
+`src/challenge/` is this repo's opening sentence made literal: *"captures a real TypeScript function's behaviour as a fixed test suite, with the original implementation as the oracle."* A `Challenge` is that capture -- a single, self-contained, plain-JSON object -- and `gradeAgainstChallenge` grades a rewrite against it without ever touching the oracle's source again.
+
+```bash
+node dist/src/cli.js capture --source examples/slugify.ts --mutate --out challenge.json
+node dist/src/cli.js grade --challenge challenge.json --rewrite candidate.ts
+```
+
+- **`captureChallenge` runs the oracle exactly once,** at capture time: analyze -> generate -> `evaluate()` the oracle -> freeze its own outcomes as `expected`. Refuses exactly like `gradeSubmission` does if the oracle isn't generatable or isn't deterministic, and drops (and records) any input the oracle consistently times out on (decision #4) -- same rules, same reasons, applied once instead of on every grading run.
+- **A `Challenge` needs nothing but itself to grade against.** `ChallengeTest.args` and `.expected` are stored as `EncodedValue`/`Outcome` (src/encoding.ts, src/protocol.ts) -- the same tagged, lossless forms already used to cross the sandbox boundary -- so the whole object is `JSON.stringify`-able with no further lifting, and grading a rewrite never re-runs, re-parses, or even needs `oracleSource` (kept only for provenance/re-capture; a distributed Challenge file could have it stripped).
+- **`id` is a content hash of `{entryName, allowedModules, tests}`,** not of the oracle's source text. Two oracles that are textually different but behaviourally identical (`x * 2` vs. `x + x`) capture to the *same* id; the same source captured twice at the same seed always does. Re-capturing after the generator improves produces a different id exactly when the tests actually differ.
+- **Mutation testing is optional at capture time** (`--mutate` / `mutationTest: true`), stored as a compact summary (score, and just the survived mutants' descriptions/locations) rather than the full mutation report -- it's a real cost (one `evaluate()` per mutant) worth paying once per challenge, not implied by capturing one.
+- **This surfaced a real, separate generator bug while it was being written:** `generateTests` produced exactly one test for any zero-parameter function. The harness's determinism check works by reordering *multiple* calls within a pass and comparing; with a single call there is nothing to reorder, so a stateful zero-parameter function (a counter with no arguments to vary) always looked deterministic no matter how stateful it actually was. `captureChallenge`'s own test suite caught this directly -- capturing a deliberately stateful zero-arg oracle didn't get refused as it should have. Fixed in `src/generator/generate.ts` to generate several identical no-argument calls instead of one.
+
+---
+
 ## Design notes
 
 ### Result channel
@@ -373,6 +390,7 @@ src/
   generator/           input generation from FunctionAnalysis (host, no execution)
   evaluator/           grades a rewrite against an oracle via evaluate() (host)
   mutator/             mutation testing: is a suite strong enough to catch a wrong rewrite? (host)
+  challenge/           captures behaviour as a fixed, self-contained, JSON-safe artifact (host)
   cli.ts
 docker/Dockerfile, docker/seccomp.json
 scripts/check-sandbox.sh
