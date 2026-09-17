@@ -16,3 +16,4 @@ export type { DockerRunnerOptions } from './host/docker-runner';
 export * from './analyzer';
 export * from './generator';
 export * from './evaluator';
+export * from './mutator';

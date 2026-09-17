@@ -3,7 +3,8 @@
  * `evaluate()` as the execution primitive for both. Runs on the HOST; every actual
  * execution still goes through the same sandboxed, two-pass pipeline as any other
  * submission -- this module only decides what "correct" means once both reports
- * come back.
+ * come back. The comparison itself (matching rules, timeout dropping) lives in
+ * compare.ts, shared with mutation testing (src/mutator/mutation-test.ts).
  *
  * This is the layer the rest of the README calls "the evaluator." It encodes the
  * grading decisions already recorded there:
@@ -12,17 +13,13 @@
  *     as a grading reference at all -- there is no single right answer to grade
  *     against. Decision #1.
  *   - An input the oracle consistently times out on is DROPPED from grading, not
- *     kept as an "expected timeout": nothing here can tell a rewrite that answers
- *     fast and correctly from one whose fast wrong answer just never happened to
- *     time out, when the oracle never produced a real value to compare against in
- *     the first place. Decision #4.
- *   - Two `thrown` outcomes match on error class plus normalised message, not on
- *     exact wording or a non-Error's full encoded value. Decision #3.
+ *     kept as an "expected timeout". Decision #4.
+ *   - Two `thrown` outcomes match on error class plus normalised message. Decision #3.
  */
 
-import { canonical } from '../encoding';
+import { compareToOracle, describeInvalid, dropOracleTimeouts, type TestVerdict as CompareVerdict } from './compare';
 import { evaluate, type EvaluateOptions, type SubmissionReport, type TestCase } from '../host/orchestrator';
-import type { Outcome, TestResult } from '../protocol';
+import type { TestResult } from '../protocol';
 
 export interface GradeOptions {
   /** The captured-behaviour original. Rejected outright if it isn't a usable oracle. */
@@ -84,11 +81,7 @@ export async function gradeSubmission(options: GradeOptions): Promise<GradeRepor
     };
   }
 
-  const droppedTestIds = options.tests
-    .map((t) => t.id)
-    .filter((id) => oracleReport.results[id].outcome.type === 'timeout');
-  const gradedTests = options.tests.filter((t) => !droppedTestIds.includes(t.id));
-
+  const { gradedTests, droppedTestIds } = dropOracleTimeouts(oracleReport, options.tests);
   if (gradedTests.length === 0) {
     return {
       verdict: 'oracle_invalid',
@@ -101,7 +94,8 @@ export async function gradeSubmission(options: GradeOptions): Promise<GradeRepor
   }
 
   const rewriteReport = await evaluate({ source: options.rewriteSource, tests: options.tests, ...shared });
-  if (rewriteReport.verdict !== 'ok') {
+  const cmp = compareToOracle(oracleReport, rewriteReport, gradedTests);
+  if (cmp.verdict === 'candidate_invalid') {
     return {
       verdict: 'rewrite_invalid',
       score: 0,
@@ -113,13 +107,10 @@ export async function gradeSubmission(options: GradeOptions): Promise<GradeRepor
     };
   }
 
-  const tests = gradedTests.map((t) => compareOne(t.id, oracleReport.results[t.id], rewriteReport.results[t.id]));
-  const matches = tests.filter((t) => t.result === 'match').length;
-
   return {
-    verdict: matches === tests.length ? 'passed' : 'failed',
-    score: matches / tests.length,
-    tests,
+    verdict: cmp.verdict,
+    score: cmp.score,
+    tests: cmp.tests.map(asRewriteVerdict),
     droppedTestIds,
     oracleReport,
     rewriteReport,
@@ -127,39 +118,8 @@ export async function gradeSubmission(options: GradeOptions): Promise<GradeRepor
   };
 }
 
-function compareOne(testId: string, oracle: TestResult, rewrite: TestResult): TestVerdict {
-  if (outcomesMatch(oracle.outcome, rewrite.outcome)) return { testId, result: 'match' };
-  return { testId, result: 'mismatch', reason: mismatchReason(oracle.outcome, rewrite.outcome), oracle, rewrite };
-}
-
-function outcomesMatch(a: Outcome, b: Outcome): boolean {
-  if (a.type !== b.type) return false;
-  if (a.type === 'return') return canonical(a.value) === canonical((b as typeof a).value);
-  if (a.type === 'thrown') {
-    const bt = b as typeof a;
-    return a.errorClass === bt.errorClass && a.message === bt.message;
-  }
-  // timeout / resource_limit / harness_error: the oracle side of these never
-  // survives to comparison (a consistent oracle timeout is dropped above, and an
-  // oracle-side resource_limit/harness_error already failed the whole run before
-  // this function is reached). A rewrite landing on one of these is always a
-  // mismatch -- it did not produce a real answer to compare.
-  return false;
-}
-
-function mismatchReason(a: Outcome, b: Outcome): string {
-  if (a.type !== b.type) return `oracle ${a.type}, rewrite ${b.type}`;
-  if (a.type === 'return') return 'different return value';
-  if (a.type === 'thrown') return 'different thrown error';
-  return `both ${a.type}`;
-}
-
-function describeInvalid(which: 'oracle' | 'rewrite', report: SubmissionReport): string {
-  if (report.verdict === 'nondeterministic') {
-    return `the ${which} is order-sensitive (carries state across calls) and cannot be graded${which === 'oracle' ? ' against' : ''}`;
-  }
-  if (report.verdict === 'rejected') {
-    return `the ${which} was rejected by static analysis or failed to transpile`;
-  }
-  return `the ${which} failed to produce a complete result set (${report.problems.map((p) => p.code).join(', ') || 'no detail'})`;
+function asRewriteVerdict(v: CompareVerdict): TestVerdict {
+  return v.result === 'match'
+    ? v
+    : { testId: v.testId, result: 'mismatch', reason: v.reason, oracle: v.oracle, rewrite: v.candidate };
 }

@@ -16,6 +16,7 @@ import { checkSource } from './import-guard';
 import { VENDORED_MODULES } from './bundle';
 import { generateTests } from './generator/generate';
 import { gradeSubmission, type GradeReport } from './evaluator/grade';
+import { runMutationTests, type MutationTestReport } from './mutator/mutation-test';
 import { DockerRunner } from './host/docker-runner';
 import { LocalRunner, type SandboxRunner } from './host/runner';
 import { evaluate, type SubmissionReport } from './host/orchestrator';
@@ -39,6 +40,10 @@ tsbox -- sandboxed TypeScript execution harness
                                     using the same tests against both (see
                                     "Evaluator" in README.md); --tests may be a
                                     file 'generate --out' produced, or hand-written
+  tsbox mutate --source <file.ts> --tests <file.json> [--max-mutants <n>] [--json]
+                                    mutation-test a suite against its own oracle:
+                                    is it strong enough to catch a wrong rewrite?
+                                    (see "Mutation testing" in README.md)
   tsbox preflight [--runner docker|local]
   tsbox verify-isolation            probe the container's isolation from inside it
 
@@ -283,6 +288,25 @@ function renderGrade(report: GradeReport): string {
   return lines.join('\n');
 }
 
+function renderMutation(report: MutationTestReport): string {
+  const lines: string[] = [];
+  lines.push(
+    report.mutationScore === undefined
+      ? 'mutation score : n/a'
+      : `mutation score : ${(report.mutationScore * 100).toFixed(1)}% (${report.killedCount} killed / ${report.killedCount + report.survivedCount} scoreable)`,
+  );
+  if (report.inconclusiveCount) lines.push(`inconclusive   : ${report.inconclusiveCount} (mutant itself never ran; doesn't count either way)`);
+  if (report.droppedTestIds.length) {
+    lines.push(`dropped        : ${report.droppedTestIds.length} test(s) the oracle itself timed out on: ${report.droppedTestIds.join(', ')}`);
+  }
+  for (const p of report.problems) lines.push(`  ! ${p.code}: ${p.detail}`);
+  for (const m of report.mutants) {
+    if (m.status !== 'survived') continue;
+    lines.push(`  SURVIVED (line ${m.line}:${m.column}): ${m.description}`);
+  }
+  return lines.join('\n');
+}
+
 // --- generate: plain-JSON conversion ---------------------------------------
 
 function sentinelForSpecialNumber(n: number): string | undefined {
@@ -492,6 +516,26 @@ async function main(): Promise<number> {
       process.stdout.write(`REJECTED [${v.code}]${where} ${v.message}\n`);
     }
     return 1;
+  }
+
+  if (args.command === 'mutate') {
+    const testsPath = one(args, 'tests');
+    if (!testsPath) throw new Error('--tests is required');
+    const { tests, entryName } = loadTests(path.resolve(testsPath));
+
+    const report = await runMutationTests({
+      oracleSource: source,
+      tests,
+      entryName: one(args, 'entry') ?? entryName,
+      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+      limits: limitsFrom(args),
+      runner: buildRunner(args),
+      seed: num(args, 'seed'),
+      mutants: { maxMutants: num(args, 'max-mutants'), seed: num(args, 'seed') },
+    });
+
+    process.stdout.write(has(args, 'json') ? `${JSON.stringify(report, null, 2)}\n` : `${renderMutation(report)}\n`);
+    return report.problems.length === 0 && report.survivedCount === 0 ? 0 : 1;
   }
 
   if (args.command !== 'run') throw new Error(`unknown command '${args.command}'`);
