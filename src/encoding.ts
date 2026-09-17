@@ -61,8 +61,8 @@ export type EncodedValue =
   | { t: 'error'; i: number; name: string; message: string; props?: Array<[string, EncodedValue]> }
   | { t: 'map'; i: number; v: Array<[EncodedValue, EncodedValue]> }
   | { t: 'set'; i: number; v: EncodedValue[] }
-  | { t: 'typedarray'; i: number; kind: string; b64: string }
-  | { t: 'arraybuffer'; i: number; b64: string }
+  | { t: 'typedarray'; i: number; kind: string; b64: string; trunc?: number }
+  | { t: 'arraybuffer'; i: number; b64: string; trunc?: number }
   /** Back-reference to an earlier node index; this is how cycles survive. */
   | { t: 'ref'; v: number }
   /** An own accessor property. Deliberately not invoked -- see module docblock. */
@@ -207,8 +207,10 @@ class Encoder {
         return this.encodeMap(value, i, depth);
       case '[object Set]':
         return this.encodeSet(value, i, depth);
-      case '[object ArrayBuffer]':
-        return { t: 'arraybuffer', i, b64: safeBufferToBase64(value) };
+      case '[object ArrayBuffer]': {
+        const { b64, truncatedFrom } = safeBufferToBase64(value);
+        return { t: 'arraybuffer', i, b64, ...(truncatedFrom !== undefined ? { trunc: truncatedFrom } : {}) };
+      }
       case '[object Promise]':
         return { t: 'unsupported', kind: 'Promise' };
       case '[object WeakMap]':
@@ -226,7 +228,8 @@ class Encoder {
 
     const taKind = tag.slice(8, -1);
     if (TYPED_ARRAY_NAMES.indexOf(taKind) !== -1) {
-      return { t: 'typedarray', i, kind: taKind, b64: safeBufferToBase64(value) };
+      const { b64, truncatedFrom } = safeBufferToBase64(value);
+      return { t: 'typedarray', i, kind: taKind, b64, ...(truncatedFrom !== undefined ? { trunc: truncatedFrom } : {}) };
     }
 
     return this.encodeObject(value as object, i, depth, tag);
@@ -335,11 +338,16 @@ class Encoder {
     // excluded on purpose: it embeds absolute paths and line numbers, so including
     // it would make every run look different from every other run.
     const props: Array<[string, EncodedValue]> = [];
-    for (const key of safeOwnKeys(value as object)) {
-      if (key === 'stack' || key === 'message' || key === 'name') continue;
-      if (props.length >= 32) break;
+    const keys = safeOwnKeys(value as object).filter((k) => k !== 'stack' && k !== 'message' && k !== 'name');
+    for (const key of keys) {
+      if (props.length >= this.budget.maxKeys) {
+        props.push(['__truncatedKeys', { t: 'truncated', reason: 'keys' }]);
+        break;
+      }
       props.push([key, this.encodeProperty(value as object, key, depth)]);
     }
+    const symbolKeys = safeOwnSymbolKeys(value as object).length;
+    if (symbolKeys) props.push(['__droppedSymbolKeys', { t: 'num', v: symbolKeys }]);
     if (props.length) node.props = props;
     return node as EncodedValue;
   }
@@ -452,7 +460,8 @@ function safeRegExpParts(v: unknown): { source: string; flags: string } {
   }
 }
 
-function safeBufferToBase64(v: unknown): string {
+/** `truncatedFrom`, when present, is the original byte length -- same convention as `str`'s `trunc`. */
+function safeBufferToBase64(v: unknown): { b64: string; truncatedFrom?: number } {
   const MAX_BYTES = 64 * 1024;
   try {
     const anyV = v as any;
@@ -460,16 +469,19 @@ function safeBufferToBase64(v: unknown): string {
       safeTag(v) === '[object ArrayBuffer]'
         ? new Uint8Array(anyV as ArrayBuffer)
         : new Uint8Array(anyV.buffer, anyV.byteOffset, anyV.byteLength);
-    return Buffer.from(view.slice(0, MAX_BYTES)).toString('base64');
+    const b64 = Buffer.from(view.slice(0, MAX_BYTES)).toString('base64');
+    return view.byteLength > MAX_BYTES ? { b64, truncatedFrom: view.byteLength } : { b64 };
   } catch {
     try {
       // Cross-realm buffers can reject the fast path; copy byte-by-byte instead.
-      const len = Math.min(Number((v as any).byteLength) || 0, MAX_BYTES);
+      const total = Number((v as any).byteLength) || 0;
+      const len = Math.min(total, MAX_BYTES);
       const bytes = new Uint8Array(len);
       for (let k = 0; k < len; k++) bytes[k] = Number((v as any)[k]) || 0;
-      return Buffer.from(bytes).toString('base64');
+      const b64 = Buffer.from(bytes).toString('base64');
+      return total > MAX_BYTES ? { b64, truncatedFrom: total } : { b64 };
     } catch {
-      return '';
+      return { b64: '' };
     }
   }
 }
@@ -638,6 +650,7 @@ class Decoder {
         }
         this.register(enc.i, err);
         for (const [key, val] of enc.props ?? []) {
+          if (key === '__truncatedKeys' || key === '__droppedSymbolKeys') continue;
           try {
             err[key] = this.decode(val);
           } catch {
@@ -699,16 +712,19 @@ export function canonical(enc: EncodedValue): string {
 
 /**
  * True if any node in `enc` lost data to a budget cap: a `{t:'truncated'}` marker,
- * a string cut short (`trunc` set), or a `__truncatedLength`/`__truncatedKeys`
- * marker hung off an array/object. Used on the INPUT side (test arguments encoded
- * before being sent into the sandbox) to detect when the encode budget silently
- * shortened what the caller actually specified -- see src/host/orchestrator.ts.
+ * a string/typed-array/arraybuffer cut short (`trunc` set), or a
+ * `__truncatedLength`/`__truncatedKeys` marker hung off an array/object/error. Used
+ * on the INPUT side (test arguments encoded before being sent into the sandbox) to
+ * detect when the encode budget silently shortened what the caller actually
+ * specified -- see src/host/orchestrator.ts.
  */
 export function hasTruncation(enc: EncodedValue): boolean {
   switch (enc.t) {
     case 'truncated':
       return true;
     case 'str':
+    case 'typedarray':
+    case 'arraybuffer':
       return enc.trunc !== undefined;
     case 'array':
       return (
@@ -719,7 +735,10 @@ export function hasTruncation(enc: EncodedValue): boolean {
     case 'object':
       return enc.v.some(([k, v]) => k === '__truncatedKeys' || hasTruncation(v));
     case 'error':
-      return enc.props?.some(([, v]) => hasTruncation(v)) ?? false;
+      return (
+        (enc.props?.some(([k]) => k === '__truncatedKeys') ?? false) ||
+        (enc.props?.some(([, v]) => hasTruncation(v)) ?? false)
+      );
     case 'map':
       return enc.v.some(([k, v]) => hasTruncation(k) || hasTruncation(v));
     case 'set':

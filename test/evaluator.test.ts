@@ -112,6 +112,45 @@ describe('gradeSubmission', () => {
     assert.equal(report.tests[0].testId, 'returns');
   });
 
+  it('a rewrite that is itself order-sensitive ONLY on a dropped input still passes on what remains', async () => {
+    // Regression: the rewrite used to be evaluated against the full test list
+    // (including the input the oracle itself dropped for timing out), so a
+    // rewrite's own instability on that exact input -- something nobody is
+    // grading -- could flip its whole run to rewrite_invalid and discard every
+    // result that was supposed to count.
+    const oracle = `
+      export function f(spin: boolean): string {
+        if (spin) { while (true) {} }
+        return 'fine';
+      }
+    `;
+    // Correct on the graded input, but returns the exact call count on the DROPPED
+    // one -- guaranteed to differ between the ordered and shuffled pass (same
+    // construction as the order-sensitivity tests elsewhere in this file), so
+    // evaluating the rewrite against the dropped input at all used to flip the
+    // whole run to nondeterministic/rewrite_invalid, discarding the 'returns'
+    // result that was actually correct and actually graded. Deterministic
+    // reproduction, not timing-dependent.
+    const rewrite = `
+      let calls = 0;
+      export function f(spin: boolean): string {
+        calls += 1;
+        if (spin) return String(calls);
+        return 'fine';
+      }
+    `;
+    const report = await gradeSubmission({
+      oracleSource: oracle,
+      rewriteSource: rewrite,
+      tests: [{ id: 'spins', args: [true] }, { id: 'returns', args: [false] }],
+      runner,
+      limits: LIMITS,
+    });
+    assert.equal(report.verdict, 'passed', JSON.stringify(report.problems));
+    assert.equal(report.tests.length, 1);
+    assert.equal(report.tests[0].testId, 'returns');
+  });
+
   it('flags a rewrite that is itself order-sensitive as rewrite_invalid, never diffed per test', async () => {
     const report = await gradeSubmission({
       oracleSource: ORACLE,

@@ -3,8 +3,9 @@
  * `evaluate()` as the execution primitive for both. Runs on the HOST; every actual
  * execution still goes through the same sandboxed, two-pass pipeline as any other
  * submission -- this module only decides what "correct" means once both reports
- * come back. The comparison itself (matching rules, timeout dropping) lives in
- * compare.ts, shared with mutation testing (src/mutator/mutation-test.ts).
+ * come back. The oracle-running and comparison steps (matching rules, timeout
+ * dropping) live in compare.ts, shared with mutation testing
+ * (src/mutator/mutation-test.ts) and challenge capture (src/challenge/capture.ts).
  *
  * This is the layer the rest of the README calls "the evaluator." It encodes the
  * grading decisions already recorded there:
@@ -17,8 +18,8 @@
  *   - Two `thrown` outcomes match on error class plus normalised message. Decision #3.
  */
 
-import { compareToOracle, describeInvalid, dropOracleTimeouts, type TestVerdict as CompareVerdict } from './compare';
-import { evaluate, type EvaluateOptions, type SubmissionReport, type TestCase } from '../host/orchestrator';
+import { compareToOracle, describeInvalid, runOracle, type TestVerdict as CompareVerdict } from './compare';
+import { evaluate, type EvaluateOptions, type Problem, type SubmissionReport, type TestCase } from '../host/orchestrator';
 import type { TestResult } from '../protocol';
 
 export interface GradeOptions {
@@ -41,10 +42,7 @@ export type TestVerdict =
   | { testId: string; result: 'match' }
   | { testId: string; result: 'mismatch'; reason: string; oracle: TestResult; rewrite: TestResult };
 
-export interface GradeProblem {
-  code: string;
-  detail: string;
-}
+export type GradeProblem = Problem;
 
 export interface GradeReport {
   verdict: GradeVerdict;
@@ -69,31 +67,25 @@ export async function gradeSubmission(options: GradeOptions): Promise<GradeRepor
     seed: options.seed,
   };
 
-  const oracleReport = await evaluate({ source: options.oracleSource, tests: options.tests, ...shared });
-  if (oracleReport.verdict !== 'ok') {
+  const oracle = await runOracle(options.oracleSource, options.tests, shared);
+  if (!oracle.ok) {
     return {
       verdict: 'oracle_invalid',
       score: 0,
       tests: [],
       droppedTestIds: [],
-      oracleReport,
-      problems: [{ code: `oracle_${oracleReport.verdict}`, detail: describeInvalid('oracle', oracleReport) }],
+      oracleReport: oracle.oracleReport,
+      problems: [oracle.problem],
     };
   }
+  const { oracleReport, gradedTests, droppedTestIds } = oracle.context;
 
-  const { gradedTests, droppedTestIds } = dropOracleTimeouts(oracleReport, options.tests);
-  if (gradedTests.length === 0) {
-    return {
-      verdict: 'oracle_invalid',
-      score: 0,
-      tests: [],
-      droppedTestIds,
-      oracleReport,
-      problems: [{ code: 'no_gradable_tests', detail: 'every test input made the oracle time out; none can be used to grade' }],
-    };
-  }
-
-  const rewriteReport = await evaluate({ source: options.rewriteSource, tests: options.tests, ...shared });
+  // gradedTests, not options.tests: the rewrite must never be run against an input
+  // the oracle itself couldn't answer reliably (a consistent timeout, dropped
+  // above). Running it there anyway would let the rewrite's own behaviour on a
+  // question nobody is grading fail the entire run via compareToOracle's
+  // candidate_invalid path -- discarding every result that WAS supposed to count.
+  const rewriteReport = await evaluate({ source: options.rewriteSource, tests: gradedTests, ...shared });
   const cmp = compareToOracle(oracleReport, rewriteReport, gradedTests);
   if (cmp.verdict === 'candidate_invalid') {
     return {

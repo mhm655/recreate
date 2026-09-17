@@ -6,15 +6,18 @@
  * `generateTests` (src/generator) only produces a *plausible* suite, never a
  * *proven-adequate* one.
  *
- * The oracle is evaluated exactly ONCE (via evaluate()) and that report is reused
- * across every mutant, both for correctness (grading every mutant against the same
- * oracle run) and for cost (an unchanged oracle source has no reason to be
- * re-evaluated once per mutant).
+ * The oracle is evaluated exactly ONCE (via evaluate(), through compare.ts's
+ * shared `runOracle`) and that report is reused across every mutant, both for
+ * correctness (grading every mutant against the same oracle run) and for cost (an
+ * unchanged oracle source has no reason to be re-evaluated once per mutant -- or,
+ * via `precomputedOracle`, once per caller that already ran it: see
+ * src/challenge/capture.ts, which captures a Challenge from the same oracle run
+ * this function would otherwise redundantly repeat).
  */
 
-import { compareToOracle, describeInvalid, dropOracleTimeouts } from '../evaluator/compare';
+import { compareToOracle, runOracle, type OracleContext } from '../evaluator/compare';
 import { generateMutants, type GenerateMutantsOptions } from './mutate';
-import { evaluate, type EvaluateOptions, type SubmissionReport, type TestCase } from '../host/orchestrator';
+import { evaluate, type EvaluateOptions, type Problem, type SubmissionReport, type TestCase } from '../host/orchestrator';
 
 export interface MutationTestOptions {
   oracleSource: string;
@@ -25,6 +28,12 @@ export interface MutationTestOptions {
   limits?: EvaluateOptions['limits'];
   seed?: number;
   mutants?: GenerateMutantsOptions;
+  /**
+   * Skips re-running the oracle when a caller already has its own `evaluate()`
+   * result for this exact `oracleSource`/`tests` (see src/challenge/capture.ts).
+   * The caller is responsible for that match; this function does not re-verify it.
+   */
+  precomputedOracle?: OracleContext;
 }
 
 export type MutantOutcome =
@@ -35,10 +44,7 @@ export type MutantOutcome =
    * mutation score either way -- it says nothing about the test suite. */
   | { id: string; description: string; line: number; column: number; status: 'inconclusive'; detail: string };
 
-export interface MutationTestProblem {
-  code: string;
-  detail: string;
-}
+export type MutationTestProblem = Problem;
 
 export interface MutationTestReport {
   oracleReport: SubmissionReport;
@@ -72,19 +78,15 @@ export async function runMutationTests(options: MutationTestOptions): Promise<Mu
     problems,
   });
 
-  const oracleReport = await evaluate({ source: options.oracleSource, tests: options.tests, ...shared });
-  if (oracleReport.verdict !== 'ok') {
-    return empty([{ code: `oracle_${oracleReport.verdict}`, detail: describeInvalid('oracle', oracleReport) }], oracleReport);
+  let oracleContext: OracleContext;
+  if (options.precomputedOracle) {
+    oracleContext = options.precomputedOracle;
+  } else {
+    const oracle = await runOracle(options.oracleSource, options.tests, shared);
+    if (!oracle.ok) return empty([oracle.problem], oracle.oracleReport);
+    oracleContext = oracle.context;
   }
-
-  const { gradedTests, droppedTestIds } = dropOracleTimeouts(oracleReport, options.tests);
-  if (gradedTests.length === 0) {
-    return empty(
-      [{ code: 'no_gradable_tests', detail: 'every test input made the oracle time out; none can be used to mutation-test' }],
-      oracleReport,
-      droppedTestIds,
-    );
-  }
+  const { oracleReport, gradedTests, droppedTestIds } = oracleContext;
 
   const mutants = generateMutants(options.oracleSource, options.mutants);
   if (mutants.length === 0) {
@@ -93,7 +95,12 @@ export async function runMutationTests(options: MutationTestOptions): Promise<Mu
 
   const outcomes: MutantOutcome[] = [];
   for (const mutant of mutants) {
-    const mutantReport = await evaluate({ source: mutant.mutatedSource, tests: options.tests, ...shared });
+    // gradedTests, not options.tests: same reasoning as gradeSubmission
+    // (src/evaluator/grade.ts) -- a mutant must never be run against an input the
+    // oracle itself couldn't answer, or flakiness on a question nobody is scoring
+    // could mark it 'killed' (or, if it happens to hang identically, 'survived')
+    // for reasons that have nothing to do with whether the suite caught it.
+    const mutantReport = await evaluate({ source: mutant.mutatedSource, tests: gradedTests, ...shared });
     const base = { id: mutant.id, description: mutant.description, line: mutant.line, column: mutant.column };
 
     if (mutantReport.verdict === 'rejected') {

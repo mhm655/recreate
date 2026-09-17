@@ -19,7 +19,7 @@ import { gradeSubmission, type GradeReport } from './evaluator/grade';
 import { runMutationTests, type MutationTestReport } from './mutator/mutation-test';
 import { captureChallenge } from './challenge/capture';
 import { gradeAgainstChallenge, type ChallengeGradeReport } from './challenge/grade';
-import type { Challenge } from './challenge/types';
+import { CHALLENGE_SCHEMA_VERSION, type Challenge } from './challenge/types';
 import { DockerRunner } from './host/docker-runner';
 import { LocalRunner, type SandboxRunner } from './host/runner';
 import { evaluate, type SubmissionReport } from './host/orchestrator';
@@ -156,6 +156,24 @@ function loadTests(file: string): { tests: TestCase[]; entryName?: string } {
   return { tests, entryName: typeof body.entryName === 'string' ? body.entryName : undefined };
 }
 
+/** Enough shape checking to fail with a readable message instead of a bare "Cannot read properties of undefined" deep inside gradeAgainstChallenge. */
+function loadChallenge(file: string): Challenge {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    throw new Error(`${file}: not valid JSON (${err instanceof Error ? err.message : String(err)})`);
+  }
+  const c = parsed as Partial<Challenge> | null;
+  if (!c || typeof c !== 'object') throw new Error(`${file}: not a Challenge (expected a JSON object)`);
+  if (typeof c.entryName !== 'string') throw new Error(`${file}: not a Challenge (missing "entryName")`);
+  if (!Array.isArray(c.tests)) throw new Error(`${file}: not a Challenge (missing "tests" array)`);
+  if (c.schemaVersion !== CHALLENGE_SCHEMA_VERSION) {
+    throw new Error(`${file}: unsupported challenge schemaVersion ${String(c.schemaVersion)} (this tsbox expects ${CHALLENGE_SCHEMA_VERSION})`);
+  }
+  return c as Challenge;
+}
+
 function buildRunner(a: Args): SandboxRunner {
   const kind = one(a, 'runner') ?? 'docker';
   if (kind === 'local') {
@@ -175,6 +193,10 @@ function buildRunner(a: Args): SandboxRunner {
     memoryMb: num(a, 'memory-mb'),
     seccompProfile: one(a, 'seccomp'),
   });
+}
+
+function modulesFrom(a: Args): string[] {
+  return a.flags.get('allow') ?? [...VENDORED_MODULES];
 }
 
 function limitsFrom(a: Args): Partial<Limits> {
@@ -441,7 +463,7 @@ async function main(): Promise<number> {
 
     const challengePath = one(args, 'challenge');
     if (challengePath) {
-      const challenge = JSON.parse(fs.readFileSync(path.resolve(challengePath), 'utf8')) as Challenge;
+      const challenge = loadChallenge(path.resolve(challengePath));
       const report = await gradeAgainstChallenge(challenge, {
         rewriteSource,
         entryName: one(args, 'entry'),
@@ -467,7 +489,7 @@ async function main(): Promise<number> {
       rewriteSource,
       tests,
       entryName: one(args, 'entry') ?? entryName,
-      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+      allowedModules: modulesFrom(args),
       limits: limitsFrom(args),
       runner: buildRunner(args),
       seed: num(args, 'seed'),
@@ -485,7 +507,7 @@ async function main(): Promise<number> {
     const result = await captureChallenge({
       oracleSource,
       entryName: one(args, 'entry'),
-      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+      allowedModules: modulesFrom(args),
       limits: limitsFrom(args),
       runner: buildRunner(args),
       seed: num(args, 'seed'),
@@ -517,7 +539,7 @@ async function main(): Promise<number> {
   if (args.command === 'analyze') {
     const result = await analyzeIsolated(source, {
       entryName: one(args, 'entry'),
-      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+      allowedModules: modulesFrom(args),
     });
     if (has(args, 'json')) {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -535,7 +557,7 @@ async function main(): Promise<number> {
   if (args.command === 'generate') {
     const analyzed = await analyzeIsolated(source, {
       entryName: one(args, 'entry'),
-      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+      allowedModules: modulesFrom(args),
     });
     if (!analyzed.ok) {
       for (const e of analyzed.errors) {
@@ -593,7 +615,7 @@ async function main(): Promise<number> {
   if (args.command === 'check') {
     const guard = checkSource(source, {
       entryName: one(args, 'entry'),
-      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+      allowedModules: modulesFrom(args),
     });
     if (guard.ok) {
       process.stdout.write(`OK  entry='${guard.entryName}'  modules=[${guard.referencedModules.join(', ')}]\n`);
@@ -615,7 +637,7 @@ async function main(): Promise<number> {
       oracleSource: source,
       tests,
       entryName: one(args, 'entry') ?? entryName,
-      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+      allowedModules: modulesFrom(args),
       limits: limitsFrom(args),
       runner: buildRunner(args),
       seed: num(args, 'seed'),
@@ -636,7 +658,7 @@ async function main(): Promise<number> {
     source,
     tests,
     entryName: one(args, 'entry') ?? entryName,
-    allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+    allowedModules: modulesFrom(args),
     limits: limitsFrom(args),
     runner: buildRunner(args),
     seed: num(args, 'seed'),

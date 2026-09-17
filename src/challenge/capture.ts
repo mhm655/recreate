@@ -7,10 +7,10 @@
 import { createHash } from 'node:crypto';
 
 import { analyzeIsolated } from '../analyzer/isolated';
-import { dropOracleTimeouts, describeInvalid } from '../evaluator/compare';
+import { runOracle } from '../evaluator/compare';
 import { encodeArgs } from '../encoding';
 import { generateTests, type GenerateOptions } from '../generator/generate';
-import { evaluate, type EvaluateOptions } from '../host/orchestrator';
+import type { EvaluateOptions } from '../host/orchestrator';
 import type { GenerateMutantsOptions } from '../mutator/mutate';
 import { runMutationTests } from '../mutator/mutation-test';
 import { CHALLENGE_SCHEMA_VERSION, type Challenge, type ChallengeMutationSummary } from './types';
@@ -58,15 +58,9 @@ export async function captureChallenge(options: CaptureOptions): Promise<Capture
     seed: options.seed,
   };
 
-  const oracleReport = await evaluate({ source: options.oracleSource, tests: generated.tests, ...shared });
-  if (oracleReport.verdict !== 'ok') {
-    return { ok: false, reason: describeInvalid('oracle', oracleReport) };
-  }
-
-  const { gradedTests, droppedTestIds } = dropOracleTimeouts(oracleReport, generated.tests);
-  if (gradedTests.length === 0) {
-    return { ok: false, reason: 'every generated test made the oracle time out; nothing left to capture' };
-  }
+  const oracle = await runOracle(options.oracleSource, generated.tests, shared);
+  if (!oracle.ok) return { ok: false, reason: oracle.problem.detail };
+  const { oracleReport, gradedTests, droppedTestIds } = oracle.context;
 
   const tests = gradedTests.map((t) => ({
     id: t.id,
@@ -77,10 +71,14 @@ export async function captureChallenge(options: CaptureOptions): Promise<Capture
   let mutationTesting: ChallengeMutationSummary | undefined;
   if (options.mutationTest) {
     const mutantOptions = typeof options.mutationTest === 'object' ? options.mutationTest : undefined;
+    // precomputedOracle: the oracle was already evaluated just above; mutation
+    // testing would otherwise re-run that same, most-expensive-step-in-the-pipeline
+    // evaluation from scratch for no reason.
     const mt = await runMutationTests({
       oracleSource: options.oracleSource,
       tests: generated.tests,
       mutants: mutantOptions,
+      precomputedOracle: oracle.context,
       ...shared,
     });
     mutationTesting = {

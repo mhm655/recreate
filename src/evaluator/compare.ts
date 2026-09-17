@@ -8,7 +8,7 @@
  */
 
 import { canonical } from '../encoding';
-import type { SubmissionReport, TestCase } from '../host/orchestrator';
+import { evaluate, type EvaluateOptions, type Problem, type SubmissionReport, type TestCase } from '../host/orchestrator';
 import type { Outcome, TestResult } from '../protocol';
 
 export type TestVerdict =
@@ -39,6 +39,51 @@ export function dropOracleTimeouts(
   const droppedTestIds = tests.map((t) => t.id).filter((id) => oracleReport.results[id].outcome.type === 'timeout');
   const gradedTests = tests.filter((t) => !droppedTestIds.includes(t.id));
   return { gradedTests, droppedTestIds };
+}
+
+export interface OracleContext {
+  oracleReport: SubmissionReport;
+  gradedTests: TestCase[];
+  droppedTestIds: string[];
+}
+
+export type OracleRunResult =
+  | { ok: true; context: OracleContext }
+  | { ok: false; oracleReport: SubmissionReport; problem: Problem };
+
+/**
+ * Evaluates an oracle and prepares it for comparison: runs `evaluate()` once,
+ * refuses it outright if its own verdict isn't `ok` (decision #1 -- an
+ * order-sensitive "oracle" has no single right answer to grade against), then
+ * drops any input it consistently timed out on (decision #4). Shared by
+ * `gradeSubmission` (grade.ts), `runMutationTests` (mutator/mutation-test.ts) and
+ * `captureChallenge` (challenge/capture.ts), which all needed the identical
+ * sequence and used to each run it by hand.
+ */
+export async function runOracle(
+  oracleSource: string,
+  tests: TestCase[],
+  evalOptions: Omit<EvaluateOptions, 'source' | 'tests'>,
+): Promise<OracleRunResult> {
+  const oracleReport = await evaluate({ source: oracleSource, tests, ...evalOptions });
+  if (oracleReport.verdict !== 'ok') {
+    return {
+      ok: false,
+      oracleReport,
+      problem: { code: `oracle_${oracleReport.verdict}`, detail: describeInvalid('oracle', oracleReport) },
+    };
+  }
+
+  const { gradedTests, droppedTestIds } = dropOracleTimeouts(oracleReport, tests);
+  if (gradedTests.length === 0) {
+    return {
+      ok: false,
+      oracleReport,
+      problem: { code: 'no_gradable_tests', detail: 'every test input made the oracle time out; none can be used to grade' },
+    };
+  }
+
+  return { ok: true, context: { oracleReport, gradedTests, droppedTestIds } };
 }
 
 /**

@@ -7,7 +7,7 @@
 
 import { decode } from '../encoding';
 import { describeInvalid, mismatchReason, outcomesMatch } from '../evaluator/compare';
-import { evaluate, type EvaluateOptions, type SubmissionReport, type TestCase } from '../host/orchestrator';
+import { evaluate, type EvaluateOptions, type Problem, type SubmissionReport, type TestCase } from '../host/orchestrator';
 import type { Outcome } from '../protocol';
 import type { Challenge } from './types';
 
@@ -27,10 +27,7 @@ export type ChallengeTestVerdict =
   | { testId: string; result: 'match' }
   | { testId: string; result: 'mismatch'; reason: string; expected: Outcome; rewrite: Outcome };
 
-export interface ChallengeGradeProblem {
-  code: string;
-  detail: string;
-}
+export type ChallengeGradeProblem = Problem;
 
 export interface ChallengeGradeReport {
   verdict: ChallengeGradeVerdict;

@@ -105,6 +105,30 @@ describe('runMutationTests', () => {
     assert.ok(report.problems.some((p) => p.code === 'no_mutants'));
   });
 
+  it('never lets an input the oracle dropped affect a mutant\'s killed/survived classification', async () => {
+    // Regression: mutants used to be evaluated against the full test list,
+    // including whatever the oracle itself consistently timed out on and got
+    // dropped. A mutant unrelated to the hanging branch has no business being
+    // judged on it either way.
+    const oracle = `
+      export function f(spin: boolean, x: number): number {
+        if (spin) { while (true) {} }
+        return x + 1;
+      }
+    `;
+    const report = await runMutationTests({
+      oracleSource: oracle,
+      tests: [{ id: 'spins', args: [true, 0] }, { id: 'returns', args: [false, 0] }],
+      runner,
+      limits: LIMITS,
+    });
+    assert.deepEqual(report.droppedTestIds, ['spins']);
+    // The `1 -> 2` literal mutant changes the graded test's result and must be
+    // killed by it, regardless of anything to do with the dropped 'spins' input.
+    const literalMutant = report.mutants.find((m) => m.description === '1 -> 2');
+    assert.equal(literalMutant?.status, 'killed');
+  });
+
   it('demonstrates the real gap this layer exists to catch: a single-typical-case suite misses a boundary bug', async () => {
     // Mirrors what a naive generated suite (one "typical" value per parameter, no
     // boundary sweep) would produce for this signature.
