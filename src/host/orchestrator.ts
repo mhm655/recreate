@@ -21,7 +21,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { parseChannel } from '../channel';
-import { canonical, encodeArgs, hasTruncation, type EncodedValue } from '../encoding';
+import { canonical, describeEncoded, encodeArgs, hasTruncation, type EncodedValue } from '../encoding';
 import { checkSource, type Violation } from '../import-guard';
 import { mulberry32 } from '../rng';
 import {
@@ -558,7 +558,7 @@ function isResourceOutcome(o: Outcome): boolean {
 export function summarizeOutcome(o: Outcome): string {
   switch (o.type) {
     case 'return':
-      return `return ${clip(canonical(o.value))}`;
+      return `return ${clip(describeEncoded(o.value))}`;
     case 'thrown':
       return `throw ${o.errorClass}: ${clip(o.message, 120)}`;
     case 'timeout':

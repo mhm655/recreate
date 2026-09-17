@@ -7,6 +7,7 @@ import {
   captureRealm,
   decode,
   DecodeError,
+  describeEncoded,
   encode,
   encodeArgs,
   normalizeErrorMessage,
@@ -395,5 +396,45 @@ describe('decoding: malformed input', () => {
     assert.equal(decode({ t: 'accessor' }), undefined);
     assert.equal(decode({ t: 'truncated', reason: 'depth' }), undefined);
     assert.equal(decode({ t: 'unsupported', kind: 'Promise' }), undefined);
+  });
+});
+
+describe('describeEncoded: human-readable rendering for reports', () => {
+  // Regression: a CLI/UI mismatch report used to render `outcome.value` via
+  // `JSON.stringify` directly on the TAGGED node -- e.g. `{"t":"str","v":"x"}`
+  // instead of `"x"` -- because that node is what the wire protocol carries, not
+  // the real decoded value. describeEncoded renders it the way the real value
+  // would print, without decode()'s "must be safe to execute against" constraints.
+  it('renders primitives the way they would actually print', () => {
+    assert.equal(describeEncoded(encode(42)), '42');
+    assert.equal(describeEncoded(encode('hello')), '"hello"');
+    assert.equal(describeEncoded(encode(true)), 'true');
+    assert.equal(describeEncoded(encode(null)), 'null');
+    assert.equal(describeEncoded(encode(undefined)), 'undefined');
+    assert.equal(describeEncoded(encode(NaN)), 'NaN');
+    assert.equal(describeEncoded(encode(-0)), '-0');
+    assert.equal(describeEncoded(encode(10n)), '10n');
+  });
+
+  it('recurses into arrays, objects, maps and sets instead of dumping their tagged form', () => {
+    assert.equal(describeEncoded(encode([1, 'x', true])), '[1, "x", true]');
+    assert.equal(describeEncoded(encode({ a: 1, b: 'y' })), '{a: 1, b: "y"}');
+    assert.equal(describeEncoded(encode(new Map([['k', 1]]))), 'Map{"k" => 1}');
+    assert.equal(describeEncoded(encode(new Set([1, 2]))), 'Set{1, 2}');
+  });
+
+  it('renders a cyclic structure without ever infinitely recursing', () => {
+    const cyclic: any = { name: 'root' };
+    cyclic.self = cyclic;
+    assert.equal(describeEncoded(encode(cyclic)), '{name: "root", self: <circular reference>}');
+  });
+
+  it('notes truncation instead of silently showing only the shortened value', () => {
+    const enc = encode('x'.repeat(50), { maxNodes: 100, maxDepth: 5, maxStringLength: 10, maxKeys: 10, maxCollectionEntries: 10 });
+    assert.equal(describeEncoded(enc), `${JSON.stringify('x'.repeat(10))}... (truncated from 50 chars)`);
+  });
+
+  it('renders an Error with its class and message, not a JSON blob', () => {
+    assert.equal(describeEncoded(encode(new RangeError('bad'))), 'RangeError("bad")');
   });
 });

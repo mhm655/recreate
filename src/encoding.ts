@@ -639,14 +639,26 @@ function defaultRealm(): Realm {
  * `arr instanceof Array` behaves the way the function author expects. Those
  * intrinsics must have been snapshotted before untrusted code ran -- see
  * `captureRealm`.
+ *
+ * `budget` must match whatever budget the ENCODE side of this exact wire message
+ * used (typically the caller's `Limits.encode`) when the value can contain a
+ * `recordCalls` replay table: matching a live call against a recorded one compares
+ * `canonical()` of two independently-produced `encodeArgs()` calls (see the 'fn'
+ * case below), and `canonical()`'s output depends on the budget the same way it
+ * depends on encode order -- two different budgets can shape identical arguments
+ * differently and make a genuinely recorded call stop matching. Defaults to
+ * `DEFAULT_ENCODE_BUDGET` for callers that never touch a non-default budget.
  */
-export function decode(enc: EncodedValue, realm: Realm = defaultRealm()): unknown {
-  return new Decoder(realm).decode(enc);
+export function decode(enc: EncodedValue, realm: Realm = defaultRealm(), budget: EncodeBudget = DEFAULT_ENCODE_BUDGET): unknown {
+  return new Decoder(realm, budget).decode(enc);
 }
 
 class Decoder {
   private readonly byIndex = new Map<number, any>();
-  constructor(private readonly realm: Realm) {}
+  constructor(
+    private readonly realm: Realm,
+    private readonly budget: EncodeBudget = DEFAULT_ENCODE_BUDGET,
+  ) {}
 
   decode(enc: EncodedValue): unknown {
     if (enc === null || typeof enc !== 'object' || typeof (enc as any).t !== 'string') {
@@ -712,7 +724,11 @@ class Decoder {
               // and get that stricter match instead.
               const match = recorded.find((entry) => {
                 const arity = entry.args.t === 'array' ? entry.args.v.length : 0;
-                return canonical(entry.args) === canonical(encodeArgs(callArgs.slice(0, arity)));
+                // Must use the SAME budget `entry.args` was originally encoded with
+                // (this.budget, threaded in from decode()'s caller) -- see decode()'s
+                // doc comment. A mismatched budget can shape identical arguments
+                // differently and make a genuinely recorded call stop matching.
+                return canonical(entry.args) === canonical(encodeArgs(callArgs.slice(0, arity), this.budget));
               });
               if (!match) {
                 throw new R.Error(
@@ -885,5 +901,87 @@ export function hasTruncation(enc: EncodedValue): boolean {
       return enc.v.some(hasTruncation);
     default:
       return false;
+  }
+}
+
+const RESERVED_MARKER_KEYS = new Set(['__truncatedLength', '__truncatedKeys', '__droppedSymbolKeys']);
+
+/**
+ * Human-readable rendering of a tagged `EncodedValue`, for surfacing a test outcome
+ * to a person (a CLI report, a UI mismatch panel) -- NOT for comparison or
+ * round-tripping. `JSON.stringify(outcome.value)` used to be used for this
+ * directly, which just dumps the wire-format tags verbatim (e.g. `{"t":"str","v":"x"}`
+ * instead of `"x"`, or an unreadable blob for a Map/Date/typed array); this walks
+ * the tagged structure the way `canonical()` and `decode()` already do and renders
+ * it the way the corresponding real JS value would print.
+ */
+export function describeEncoded(enc: EncodedValue, seen: Set<number> = new Set()): string {
+  switch (enc.t) {
+    case 'undefined':
+      return 'undefined';
+    case 'null':
+      return 'null';
+    case 'bool':
+    case 'num':
+      return String(enc.v);
+    case 'special':
+      return enc.v;
+    case 'str':
+      return enc.trunc !== undefined ? `${JSON.stringify(enc.v)}... (truncated from ${enc.trunc} chars)` : JSON.stringify(enc.v);
+    case 'bigint':
+      return `${enc.v}n`;
+    case 'symbol':
+      return `Symbol(${enc.v})`;
+    case 'fn':
+      return enc.name ? `${enc.cls ? 'class' : 'function'} ${enc.name}` : `${enc.cls ? 'an anonymous class' : 'an anonymous function'}`;
+    case 'ref':
+      return '<circular reference>';
+    case 'accessor':
+      return '<getter>';
+    case 'truncated':
+      return `<truncated: ${enc.reason} limit reached>`;
+    case 'unsupported':
+      return `<unsupported: ${enc.kind}>`;
+    case 'date':
+      return enc.v === null ? 'Invalid Date' : new Date(enc.v).toISOString();
+    case 'regexp':
+      return `/${enc.source}/${enc.flags}`;
+    case 'typedarray':
+      return `${enc.kind}(${enc.trunc !== undefined ? `truncated from ${enc.trunc} bytes` : 'base64 ' + enc.b64.length + ' chars'})`;
+    case 'arraybuffer':
+      return `ArrayBuffer(${enc.trunc !== undefined ? `truncated from ${enc.trunc} bytes` : enc.b64.length + ' base64 chars'})`;
+    case 'array': {
+      if (seen.has(enc.i)) return '<circular reference>';
+      const next = new Set(seen).add(enc.i);
+      const items = enc.v.map((v) => describeEncoded(v, next));
+      const extra = (enc.props ?? []).filter(([k]) => !RESERVED_MARKER_KEYS.has(k)).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
+      return `[${[...items, ...extra].join(', ')}]`;
+    }
+    case 'object': {
+      if (seen.has(enc.i)) return '<circular reference>';
+      const next = new Set(seen).add(enc.i);
+      const entries = enc.v.filter(([k]) => !RESERVED_MARKER_KEYS.has(k)).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
+      const prefix = enc.ctor && enc.ctor !== 'Object' ? `${enc.ctor} ` : '';
+      return `${prefix}{${entries.join(', ')}}`;
+    }
+    case 'error': {
+      if (seen.has(enc.i)) return '<circular reference>';
+      const next = new Set(seen).add(enc.i);
+      const extra = (enc.props ?? []).filter(([k]) => !RESERVED_MARKER_KEYS.has(k)).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
+      return `${enc.name}(${JSON.stringify(enc.message)})${extra.length ? ` {${extra.join(', ')}}` : ''}`;
+    }
+    case 'map': {
+      if (seen.has(enc.i)) return '<circular reference>';
+      const next = new Set(seen).add(enc.i);
+      const entries = enc.v.map(([k, v]) => `${describeEncoded(k, next)} => ${describeEncoded(v, next)}`);
+      return `Map{${entries.join(', ')}}`;
+    }
+    case 'set': {
+      if (seen.has(enc.i)) return '<circular reference>';
+      const next = new Set(seen).add(enc.i);
+      return `Set{${enc.v.map((v) => describeEncoded(v, next)).join(', ')}}`;
+    }
+    default:
+      return 'unknown value';
   }
 }

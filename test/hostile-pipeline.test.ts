@@ -656,6 +656,32 @@ describe('function and class-instance arguments', () => {
       assert.equal(outcome.type, 'thrown');
       assert.match(outcome.message, /never recorded for it/);
     });
+
+    it('still matches a recorded call under a non-default encode budget', async () => {
+      // Regression: the recorded entry's args are encoded on the HOST using the
+      // caller's real `limits.encode` budget (Encoder's 'fn' branch reuses its own
+      // ambient budget). But the SANDBOX's replay matcher used to re-encode a live
+      // call's args with the hardcoded default budget regardless -- decode() never
+      // received a budget at all. Two different budgets can shape an identical
+      // long string differently (a custom maxStringLength here), so a genuinely
+      // recorded call stopped matching the moment a caller used any budget other
+      // than the default -- masked until now only because DEFAULT_ENCODE_BUDGET and
+      // DEFAULT_LIMITS.encode happened to hold identical numbers.
+      const longString = 'a string longer than ten characters';
+      const cb = recordCalls((s: string) => s.length, [[longString]]);
+      const CALLS_WITH_LITERAL = `
+        export function callIt(cb: (s: string) => number): number {
+          return cb('${longString}');
+        }
+      `;
+      const report = await run(
+        CALLS_WITH_LITERAL,
+        [{ id: 't', args: [cb] }],
+        { limits: { ...LIMITS, encode: { ...DEFAULT_LIMITS.encode, maxStringLength: 10 } } },
+      );
+      assert.equal(report.verdict, 'ok', explain(report));
+      assert.equal(returned(report.results.t), longString.length);
+    });
   });
 });
 

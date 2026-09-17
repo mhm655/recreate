@@ -290,7 +290,7 @@ async function runTest(msg: ToWorker): Promise<void> {
   // the function's author expects; cross-realm objects would silently fail those.
   let args: unknown[];
   try {
-    const decoded = decode(msg.args, compiled.realm);
+    const decoded = decode(msg.args, compiled.realm, init.limits.encode);
     args = Array.isArray(decoded) ? (decoded as unknown[]) : [decoded];
   } catch (err) {
     reply(
