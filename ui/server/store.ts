@@ -26,7 +26,15 @@ export async function saveChallenge(challenge: Challenge): Promise<void> {
   await fs.writeFile(path.join(dir, `${challenge.id}.json`), `${JSON.stringify(challenge, null, 2)}\n`, 'utf8');
 }
 
+// Every id this store hands out is a 16-char lowercase hex content hash (capture.ts's
+// contentId). Enforcing that shape here -- not just trusting the caller -- closes a path
+// traversal: an id built from an HTTP route param (see server/app.ts) is otherwise
+// attacker-controlled, and `${id}.json` joined onto a directory happily resolves
+// '../../../whatever' right out of the challenges directory.
+const VALID_ID = /^[0-9a-f]{16}$/;
+
 export async function loadChallenge(id: string): Promise<Challenge | null> {
+  if (!VALID_ID.test(id)) return null;
   try {
     const raw = await fs.readFile(path.join(challengesDir(), `${id}.json`), 'utf8');
     return JSON.parse(raw) as Challenge;

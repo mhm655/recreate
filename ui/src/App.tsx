@@ -174,7 +174,7 @@ export default function App() {
           <div className="result">
             <p>
               Challenge <code>{challenge.id}</code> for <code>{challenge.entryName}</code> -- {challenge.tests.length} test(s)
-              {challenge.droppedTestIds.length > 0 && `, ${challenge.droppedTestIds.length} dropped (oracle timed out)`}
+              {challenge.droppedTestIds.length > 0 && `, ${challenge.droppedTestIds.length} dropped (oracle couldn't answer)`}
             </p>
             <MutationSummary summary={challenge.mutationTesting} />
             <details>

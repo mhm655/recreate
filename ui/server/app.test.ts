@@ -93,6 +93,20 @@ describe('GET /api/challenges and /api/challenges/:id', () => {
     const res = await fetch(`${baseUrl}/api/challenges/not-a-real-id`);
     expect(res.status).toBe(404);
   });
+
+  it('404s a path-traversal id instead of reading a file outside the challenges directory', async () => {
+    // Regression: loadChallenge used to join the raw route param straight onto the
+    // challenges directory, so an id like '../secret' escaped it entirely. Plant a
+    // real file exactly where that escape would land and confirm it is never served.
+    const secretPath = path.join(dataDir, '..', 'secret.json');
+    await fs.writeFile(secretPath, JSON.stringify({ leaked: true }));
+    try {
+      const res = await fetch(`${baseUrl}/api/challenges/${encodeURIComponent('../secret')}`);
+      expect(res.status).toBe(404);
+    } finally {
+      await fs.rm(secretPath, { force: true });
+    }
+  });
 });
 
 describe('POST /api/grade', () => {
