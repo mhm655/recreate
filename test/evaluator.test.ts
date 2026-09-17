@@ -115,9 +115,18 @@ describe('gradeSubmission', () => {
   it('flags a rewrite that is itself order-sensitive as rewrite_invalid, never diffed per test', async () => {
     const report = await gradeSubmission({
       oracleSource: ORACLE,
+      // Result depends on the exact call count, not just "first vs. later": with 3
+      // tests, `shuffle()` guarantees a non-identity permutation, and any
+      // non-identity permutation of 3+ elements moves at least two of them to a
+      // different position, so at least one test is GUARANTEED to see a different
+      // call count -- and therefore a different result -- between the ordered and
+      // shuffled pass, regardless of the random seed. (An earlier version used
+      // `calls > 1 ? 1 : 0`, which only distinguished "first call" from "any later
+      // call": a shuffle that happened to leave the originally-first test in first
+      // position produced no divergence at all, which is exactly the flake CI hit.)
       rewriteSource: `
         let calls = 0;
-        export function double(x: number): number { calls += 1; return x * 2 + (calls > 1 ? 1 : 0); }
+        export function double(x: number): number { calls += 1; return x * 2 + calls; }
       `,
       tests: TESTS,
       runner,
