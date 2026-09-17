@@ -44,7 +44,7 @@ export type EncodedValue =
   | { t: 'bigint'; v: string }
   /** Symbols round-trip by description only; identity is deliberately not preserved. */
   | { t: 'symbol'; v: string }
-  | { t: 'fn'; i: number; name: string; cls: boolean }
+  | { t: 'fn'; i: number; name: string; cls: boolean; recorded?: RecordedCallEntry[] }
   | {
       t: 'array';
       i: number;
@@ -77,6 +77,17 @@ export interface EncodeBudget {
   maxKeys: number;
   maxCollectionEntries: number;
 }
+
+/**
+ * One recorded call: the arguments it was called with, and what happened. Reuses
+ * the encoder's own tagged forms rather than protocol.ts's `Outcome` -- encoding.ts
+ * sits below protocol.ts in the dependency order (protocol.ts imports from here),
+ * so it can't import that type back without a cycle, and this is a small enough
+ * shape that duplicating it isn't a real cost.
+ */
+export type RecordedCallEntry = {
+  args: EncodedValue;
+} & ({ type: 'return'; value: EncodedValue } | { type: 'thrown'; errorClass: string; message: string });
 
 export const DEFAULT_ENCODE_BUDGET: EncodeBudget = {
   maxNodes: 20_000,
@@ -124,6 +135,75 @@ export function captureRealm(g: any = globalThis): Realm {
     Map: g.Map, Set: g.Set, ArrayBuffer: g.ArrayBuffer, Uint8Array: g.Uint8Array,
     Error: g.Error, errors, typedArrays,
   };
+}
+
+// --- recorded calls (bounded callback/method support) ---------------------
+
+/**
+ * Marks a function as carrying a replay table, checked for during encoding
+ * (below). Module-private on purpose: the only supported way to attach one is
+ * `recordCalls`, which guarantees the table's `args`/outcome actually came from
+ * calling the real function -- never fabricated data pretending to be a recording.
+ */
+const RECORDED_CALLS = Symbol('recordedCalls');
+
+interface RawRecordedCall {
+  args: unknown[];
+  outcome: { type: 'return'; value: unknown } | { type: 'thrown'; errorClass: string; message: string };
+}
+
+/**
+ * A live, real function still cannot cross into the sandbox -- there is no channel
+ * to call back out to it (see README, "Decisions for the next layers" #6). What
+ * CAN cross is a bounded, pre-computed record of exactly what it did for a known
+ * set of inputs, decided and captured entirely on the HOST, before the sandbox
+ * ever runs.
+ *
+ * `recordCalls(fn, inputs)` calls `fn` once per entry in `inputs` right now (on the
+ * host) and returns a function that, once encoded as a test argument and decoded
+ * inside the sandbox, replays the matching recorded outcome for a call whose
+ * arguments match (compared structurally, via `canonical()`) -- and throws a clear,
+ * attributable error for any call outside that table, rather than silently
+ * fabricating a plausible-looking answer. This is the harness's answer to
+ * "callbacks as arguments" for the one case that's actually safe to support: the
+ * caller already knows exactly what the callback will be called with (e.g. every
+ * element of an array the submission is also given), which covers `map`/`filter`/
+ * `forEach`-style callback parameters without needing a live channel out of the
+ * sandbox.
+ *
+ * Matching is on however many arguments EACH recorded entry has, not full arity:
+ * `recordCalls(f, [[1], [2]])` matches a live call of `f(1)` just as much as
+ * `f(1, 0, [1, 2])` -- `Array.prototype.map`/`forEach`/`filter` all call their
+ * callback as `(element, index, array)`, and recording just the element is
+ * normally what's meant. Record longer tuples (`[[1, 0], [2, 1]]`) to also pin
+ * down the index. A submission that calls the callback with something not
+ * matching any recorded entry still gets the same loud failure a bare callback
+ * argument always has.
+ *
+ * The returned function still calls straight through to `fn` when invoked for
+ * real (outside the sandbox) -- recording does not change its behaviour, only
+ * what travels with it when it's encoded.
+ */
+export function recordCalls<A extends unknown[], R>(fn: (...args: A) => R, inputs: readonly A[]): (...args: A) => R {
+  const calls: RawRecordedCall[] = inputs.map((args) => {
+    try {
+      return { args, outcome: { type: 'return', value: fn(...args) } };
+    } catch (err) {
+      const name = err instanceof Error ? err.name : 'NonError';
+      const message = err instanceof Error ? err.message : String(err);
+      return { args, outcome: { type: 'thrown', errorClass: name, message } };
+    }
+  });
+  const wrapped = ((...args: A): R => fn(...args)) as ((...args: A) => R) & { [RECORDED_CALLS]?: RawRecordedCall[] };
+  wrapped[RECORDED_CALLS] = calls;
+  try {
+    // Otherwise the wrapper's own binding name ('wrapped') would shadow the real
+    // function's name in every diagnostic message the decoded proxy can produce.
+    Object.defineProperty(wrapped, 'name', { value: fn.name, configurable: true });
+  } catch {
+    /* non-configurable name on fn; keep the wrapper's own */
+  }
+  return wrapped;
 }
 
 // --- encoding -------------------------------------------------------------
@@ -181,7 +261,30 @@ class Encoder {
       } catch {
         /* exotic/proxied function: keep the defaults above */
       }
-      return { t: 'fn', i, name: clamp(name, 200), cls };
+      const node: EncodedValue = { t: 'fn', i, name: clamp(name, 200), cls };
+      const raw = (value as { [RECORDED_CALLS]?: RawRecordedCall[] })[RECORDED_CALLS];
+      if (raw?.length) {
+        // Capped, not truncated-with-a-marker like other collections: this list
+        // came from the caller explicitly, not from walking arbitrary submission
+        // output, so silently keeping only the first N is enough -- a call outside
+        // the cap gets the same clear "no recorded result" failure as one the
+        // caller never recorded at all.
+        (node as { recorded?: RecordedCallEntry[] }).recorded = raw.slice(0, this.budget.maxCollectionEntries).map((call) => ({
+          // encodeArgs, NOT this.encode: it's compared later via canonical() against
+          // a call's live arguments, ALSO encoded via a fresh encodeArgs() call (see
+          // the decoder's 'fn' case below). canonical()'s output embeds each node's
+          // index, which is only stable within one standalone encode -- reusing
+          // this ambient, already-partway-through-the-document encoder here would
+          // give the same logical arguments a different index purely because of
+          // where in the document this entry happens to sit, and the comparison
+          // would never match even for genuinely identical arguments.
+          args: encodeArgs(call.args, this.budget),
+          ...(call.outcome.type === 'return'
+            ? { type: 'return' as const, value: this.encode(call.outcome.value, depth + 1) }
+            : { type: 'thrown' as const, errorClass: clamp(call.outcome.errorClass, 200), message: normalizeErrorMessage(call.outcome.message) }),
+        }));
+      }
+      return node;
     }
 
     const tag = safeTag(value);
@@ -581,19 +684,56 @@ class Decoder {
       case 'symbol':
         return Symbol(enc.v);
       case 'fn': {
-        // Functions cannot be passed into the sandbox (see README, "Decisions for
-        // the next layers" #6): there is no channel to call back out to whatever
-        // real function the original argument was. A no-op placeholder would let a
-        // submission that actually invokes a callback argument silently get
-        // `undefined` back and carry on -- indistinguishable from a callback that
-        // legitimately returned nothing. Throwing on call instead turns that into a
-        // loud, attributable failure of the call, not a wrong answer.
+        // A live function still cannot cross into the sandbox (see README,
+        // "Decisions for the next layers" #6): there is no channel to call back out
+        // to whatever real function the original argument was. A no-op placeholder
+        // would let a submission that actually invokes a callback argument silently
+        // get `undefined` back and carry on -- indistinguishable from a callback
+        // that legitimately returned nothing. Throwing on call instead turns that
+        // into a loud, attributable failure of the call, not a wrong answer.
+        //
+        // `enc.recorded`, when present, is the one exception: a bounded, exact
+        // replay table built on the host by `recordCalls` BEFORE this ever reached
+        // the sandbox (see that function's docs). A call matching one of those
+        // recorded argument lists replays the real outcome; anything else still
+        // gets the same loud failure as an unrecorded callback.
         const name = typeof enc.name === 'string' ? enc.name : '';
         const label = name ? `${enc.cls ? 'class' : 'function'} '${name}'` : `an anonymous ${enc.cls ? 'class' : 'function'}`;
-        const message = `${label} was passed as an argument but functions cannot be reconstructed inside the sandbox`;
-        const fn = function decodedFunctionPlaceholder(): never {
-          throw new R.Error(message);
-        };
+        const recorded = enc.recorded;
+        const fn = recorded?.length
+          ? (...callArgs: unknown[]): unknown => {
+              // Matches on however many arguments EACH recorded entry has,
+              // ignoring anything past that in the real call -- not a strict
+              // full-arity match. `Array.prototype.map`/`forEach`/`filter` all call
+              // their callback as `(element, index, array)`, not just `(element)`;
+              // recording `[[1], [2], [3]]` and having it match a live `cb(1, 0,
+              // [1,2,3])` call is the whole point, not a loophole. A caller who
+              // does care about the index/array can record `[1, 0]`-shaped tuples
+              // and get that stricter match instead.
+              const match = recorded.find((entry) => {
+                const arity = entry.args.t === 'array' ? entry.args.v.length : 0;
+                return canonical(entry.args) === canonical(encodeArgs(callArgs.slice(0, arity)));
+              });
+              if (!match) {
+                throw new R.Error(
+                  `${label} was called with arguments that were never recorded for it: ${JSON.stringify(callArgs)}`,
+                );
+              }
+              if (match.type === 'thrown') {
+                const Ctor = R.errors[match.errorClass] ?? R.Error;
+                const err = new Ctor(match.message);
+                try {
+                  err.name = match.errorClass;
+                } catch {
+                  /* ignore */
+                }
+                throw err;
+              }
+              return this.decode(match.value);
+            }
+          : function decodedFunctionPlaceholder(): never {
+              throw new R.Error(`${label} was passed as an argument but functions cannot be reconstructed inside the sandbox`);
+            };
         try {
           Object.defineProperty(fn, 'name', { value: name });
         } catch {

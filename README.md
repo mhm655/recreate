@@ -135,6 +135,19 @@ const report = await evaluate({
 });
 ```
 
+A test input built this way can also carry a callback argument, via `recordCalls` (see decision #6 below for what it can and can't do):
+
+```ts
+import { evaluate, recordCalls, DockerRunner } from 'ts-sandbox-harness';
+
+const cb = recordCalls((x: number) => x * 2, [[1], [2], [3]]);
+const report = await evaluate({
+  source,                                        // e.g. `arr.map(cb)`
+  tests: [{ id: 't1', args: [[1, 2, 3], cb] }],
+  runner: new DockerRunner(),
+});
+```
+
 ### Reading a report
 
 `verdict` says whether the **run is valid**, not whether the function is correct. Comparing against an oracle belongs to the evaluation layer that sits on top of this one.
@@ -372,7 +385,8 @@ Decided (2026-09-16):
 4. **Inputs on which the original times out are dropped** during generation instead of being kept as expected timeouts.
 
 5. **Real dependencies are supported through host-side bundling, not a runtime resolver.** A short vetted list (`VENDORED_MODULES`, currently `lodash-es`) is inlined into the transpiled submission by esbuild before it reaches the worker, so the sandbox still ships no `node_modules` and `require` still throws in the realm. See "Vendored dependencies" above. Extending the list is a per-package vetting decision, not a mechanism change.
-6. **Functions and class instances stay permanently unsupported as argument *values*,** not just unimplemented -- there is no channel for the sandbox to call back out to a real function on the other side of the boundary, and reconstructing a class instance without its methods would just be a plain object with a label. The analyzer already reports these as blockers (or omits them when optional) so the not-yet-built input generator never has to produce one. What changed here: a decoded function argument used to be a silent no-op, so a submission that actually *called* a callback argument got a plausible-looking `undefined` back -- indistinguishable from a callback that legitimately returned nothing. It now throws a labelled error on call, turning that into a loud, attributable failure of the call instead of a wrong answer that looks right. Class instances still decode to plain objects with `ctor` recorded (unchanged); a submission that calls a method the plain object doesn't have already fails loudly for the same reason.
+6. **A live function argument still cannot cross into the sandbox -- there is no channel to call back out to it -- but a *bounded, pre-computed record* of what it did for a known set of inputs now can.** `recordCalls(fn, inputs)` (`src/encoding.ts`) calls `fn` once per input right now, on the host, and returns a function that -- once encoded as a test argument and decoded inside the sandbox -- replays the matching recorded outcome (return value or thrown error) for a call whose arguments match, and throws the same loud, attributable "cannot be reconstructed" failure as before for any call outside that table. This covers `map`/`filter`/`forEach`-style callback parameters, where the caller already knows exactly what elements the callback will be called with; matching is on however many arguments each recorded entry has, not full arity, since those array methods call their callback as `(element, index, array)` and recording just the element is normally what's meant. It does *not* cover a callback the submission calls with values it computes itself (there is nothing to record those against) -- that still fails loudly, which is the right behaviour for an argument that was never going to be safe to fabricate an answer for.
+   Reachable only through the JS API's hand-authored `TestCase[]` (`evaluate()`/`gradeSubmission()`): `generateTests` still cannot invent a meaningful callback implementation on its own, so a required function-typed parameter is still a generator blocker, and `captureChallenge` -- which always builds its test list via `generateTests` -- never produces one either. A class instance argument still decodes to a plain object with `ctor` recorded and no methods; attaching a `recordCalls`-wrapped function as an own property before passing the instance works today with no further changes (it's encoded exactly like a bare callback argument, since object properties are encoded recursively), but there's no dedicated ergonomic helper for that yet.
 
 ---
 

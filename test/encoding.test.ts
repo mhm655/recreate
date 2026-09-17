@@ -10,6 +10,7 @@ import {
   encode,
   encodeArgs,
   normalizeErrorMessage,
+  recordCalls,
   type EncodedValue,
 } from '../src/encoding';
 
@@ -171,6 +172,64 @@ describe('encoding: primitives and built-ins', () => {
   it('a decoded class placeholder also throws, including when called with `new`', () => {
     const decoded = decode(encode(class Widget {})) as new (...a: unknown[]) => unknown;
     assert.throws(() => new decoded(), /Widget.*cannot be reconstructed/);
+  });
+});
+
+describe('encoding: recordCalls (bounded callback support)', () => {
+  it('still calls straight through to the real function outside the sandbox', () => {
+    const wrapped = recordCalls((x: number) => x * 2, [[1], [2]]);
+    assert.equal(wrapped(21), 42);
+  });
+
+  it('replays a recorded return value for matching arguments, after a full JSON round-trip', () => {
+    const wrapped = recordCalls((x: number, y: string) => `${y}:${x}`, [[1, 'a'], [2, 'b']]);
+    const decoded = roundTrip(wrapped) as (x: number, y: string) => string;
+    assert.equal(decoded(1, 'a'), 'a:1');
+    assert.equal(decoded(2, 'b'), 'b:2');
+  });
+
+  it('replays a recorded thrown outcome, as the same error class and message', () => {
+    const risky = (x: number) => {
+      if (x < 0) throw new RangeError('negative');
+      return x;
+    };
+    const decoded = roundTrip(recordCalls(risky, [[-1], [5]])) as (x: number) => number;
+    assert.equal(decoded(5), 5);
+    assert.throws(() => decoded(-1), (err: unknown) => err instanceof RangeError && (err as Error).message === 'negative');
+  });
+
+  it('matches arguments structurally, not by reference -- NaN and -0 included', () => {
+    const wrapped = recordCalls((x: number) => x, [[NaN], [-0]]);
+    const decoded = roundTrip(wrapped) as (x: number) => number;
+    assert.ok(Number.isNaN(decoded(NaN)));
+    assert.ok(Object.is(decoded(-0), -0));
+  });
+
+  it('throws a clear, attributable error for a call outside the recorded set -- never a plausible-looking guess', () => {
+    const decoded = roundTrip(recordCalls((x: number) => x * 2, [[1], [2]])) as (x: number) => number;
+    assert.throws(() => decoded(999), /never recorded for it/);
+  });
+
+  it('preserves the original function\'s name for diagnostics, not the wrapper\'s own binding name', () => {
+    function double(x: number): number {
+      return x * 2;
+    }
+    const wrapped = recordCalls(double, [[1]]);
+    assert.equal(wrapped.name, 'double');
+    const decoded = roundTrip(wrapped) as (x: number) => number;
+    assert.throws(() => decoded(999), /function 'double' was called/);
+  });
+
+  it('caps the recorded table at the encode budget instead of growing the payload unbounded', () => {
+    const inputs = Array.from({ length: 5 }, (_, i) => [i] as [number]);
+    const wrapped = recordCalls((x: number) => x, inputs);
+    const enc = encode(wrapped, { maxNodes: 20_000, maxDepth: 32, maxStringLength: 16_384, maxKeys: 1_000, maxCollectionEntries: 2 });
+    assert.equal((enc as { recorded?: unknown[] }).recorded?.length, 2);
+  });
+
+  it('a bare (unrecorded) function argument still throws exactly as before -- recordCalls is opt-in, not a behaviour change', () => {
+    const decoded = roundTrip(function bareCallback() {}) as () => void;
+    assert.throws(() => decoded(), /cannot be reconstructed inside the sandbox/);
   });
 });
 

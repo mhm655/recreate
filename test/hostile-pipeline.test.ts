@@ -17,7 +17,7 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import * as path from 'node:path';
 
-import { decode, encodeArgs, frame, newResultKey, parseChannel, type EncodedValue } from '../src/index';
+import { decode, encodeArgs, frame, newResultKey, parseChannel, recordCalls, type EncodedValue } from '../src/index';
 import { DockerRunner } from '../src/host/docker-runner';
 import { evaluate, reconcile, type SubmissionReport, type TestCase } from '../src/host/orchestrator';
 import { LocalRunner, type RunnerResult, type SandboxRunner } from '../src/host/runner';
@@ -566,6 +566,96 @@ describe('function and class-instance arguments', () => {
     const report = await run(IGNORES_ITS_CALLBACK, [{ id: 't', args: [() => 1] }]);
     assert.equal(report.verdict, 'ok', explain(report));
     assert.equal(returned(report.results.t), 'fine');
+  });
+
+  describe('recordCalls: bounded callback support through the real sandbox', () => {
+    const MAPS_WITH_CALLBACK = `
+      export function mapArray(arr: number[], cb: (x: number) => number): number[] {
+        return arr.map(cb);
+      }
+    `;
+
+    it('a submission that calls a recorded callback exactly on the recorded inputs gets the real behaviour, end to end', async () => {
+      const cb = recordCalls((x: number) => x * 2, [[1], [2], [3]]);
+      const report = await run(MAPS_WITH_CALLBACK, [{ id: 't', args: [[1, 2, 3], cb] }]);
+      assert.equal(report.verdict, 'ok', explain(report));
+      assert.deepEqual(returned(report.results.t), [2, 4, 6]);
+    });
+
+    it('a recorded thrown outcome propagates as a real thrown error from inside the submission', async () => {
+      const risky = recordCalls(
+        (x: number) => {
+          if (x === 2) throw new RangeError('no twos');
+          return x;
+        },
+        [[1], [2], [3]],
+      );
+      const report = await run(MAPS_WITH_CALLBACK, [{ id: 't', args: [[1, 2, 3], risky] }]);
+      assert.equal(report.verdict, 'ok', explain(report));
+      const outcome = report.results.t.outcome as { type: string; errorClass: string; message: string };
+      assert.equal(outcome.type, 'thrown');
+      assert.equal(outcome.errorClass, 'RangeError');
+      assert.equal(outcome.message, 'no twos');
+    });
+
+    it('a call outside the recorded set still fails loudly, not with a plausible-looking wrong answer', async () => {
+      // Deliberately calls cb one-off from the array elements it was given
+      // (cb(2), cb(3), cb(4) instead of cb(1), cb(2), cb(3)) -- a real bug a
+      // rewrite might have, not a contrived encoding edge case.
+      const OFF_BY_ONE = `
+        export function mapArrayPlusOne(arr: number[], cb: (x: number) => number): number[] {
+          return arr.map((x) => cb(x + 1));
+        }
+      `;
+      const cb = recordCalls((x: number) => x * 2, [[1], [2], [3]]);
+      const report = await run(OFF_BY_ONE, [{ id: 't', args: [[1, 2, 3], cb] }]);
+      assert.equal(report.verdict, 'ok', explain(report));
+      const outcome = report.results.t.outcome as { type: string; message: string };
+      assert.equal(outcome.type, 'thrown');
+      assert.match(outcome.message, /never recorded for it/);
+    });
+
+    it('both passes (ordered and shuffled) agree when the recorded callback is pure -- verdict stays ok, not nondeterministic', async () => {
+      const cb = recordCalls((x: number) => x * 10, [[1], [2], [3], [4]]);
+      const report = await run(MAPS_WITH_CALLBACK, [
+        { id: 'a', args: [[1, 2], cb] },
+        { id: 'b', args: [[3, 4], cb] },
+      ]);
+      assert.equal(report.verdict, 'ok', explain(report));
+      assert.deepEqual(returned(report.results.a), [10, 20]);
+      assert.deepEqual(returned(report.results.b), [30, 40]);
+    });
+
+    it('composes with a class instance: a recorded method attached as an own property is callable, an unrecorded call still fails loudly', async () => {
+      class Adder {
+        constructor(private readonly base: number) {}
+        add(x: number): number {
+          return this.base + x;
+        }
+      }
+      const instance = new Adder(10);
+      const proxy = Object.assign({}, instance, { add: recordCalls(instance.add.bind(instance), [[1], [2]]) });
+
+      const USES_ADDER = `
+        export function useAdder(adder: { add: (x: number) => number }): number {
+          return adder.add(1) + adder.add(2);
+        }
+      `;
+      const good = await run(USES_ADDER, [{ id: 't', args: [proxy] }]);
+      assert.equal(good.verdict, 'ok', explain(good));
+      assert.equal(returned(good.results.t), 23); // (10+1) + (10+2)
+
+      const CALLS_UNRECORDED = `
+        export function useAdder(adder: { add: (x: number) => number }): number {
+          return adder.add(99);
+        }
+      `;
+      const bad = await run(CALLS_UNRECORDED, [{ id: 't', args: [proxy] }]);
+      assert.equal(bad.verdict, 'ok', explain(bad));
+      const outcome = bad.results.t.outcome as { type: string; message: string };
+      assert.equal(outcome.type, 'thrown');
+      assert.match(outcome.message, /never recorded for it/);
+    });
   });
 });
 

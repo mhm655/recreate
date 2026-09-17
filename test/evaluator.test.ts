@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { gradeSubmission } from '../src/evaluator/grade';
+import { recordCalls } from '../src/encoding';
 import { LocalRunner } from '../src/host/runner';
 import type { TestCase } from '../src/host/orchestrator';
 
@@ -174,5 +175,31 @@ describe('gradeSubmission', () => {
     assert.equal(report.verdict, 'rewrite_invalid');
     assert.equal(report.tests.length, 0);
     assert.ok(report.problems.some((p) => p.code === 'rewrite_nondeterministic'));
+  });
+
+  it('grades a callback argument via recordCalls: a correct rewrite passes, a buggy one fails', async () => {
+    const oracle = 'export function mapArray(arr: number[], cb: (x: number) => number): number[] { return arr.map(cb); }';
+    const cb = recordCalls((x: number) => x * 2, [[1], [2], [3]]);
+    const tests: TestCase[] = [{ id: 't', args: [[1, 2, 3], cb] }];
+
+    const good = await gradeSubmission({
+      oracleSource: oracle,
+      rewriteSource: 'export function mapArray(arr: number[], cb: (x: number) => number): number[] { const out: number[] = []; for (const x of arr) out.push(cb(x)); return out; }',
+      tests,
+      runner,
+      limits: LIMITS,
+    });
+    assert.equal(good.verdict, 'passed', JSON.stringify(good.problems));
+
+    const bad = await gradeSubmission({
+      oracleSource: oracle,
+      // Off by one: adds 1 after calling cb, so the numbers are wrong but the
+      // callback is still called on the same, recorded elements.
+      rewriteSource: 'export function mapArray(arr: number[], cb: (x: number) => number): number[] { return arr.map((x) => cb(x) + 1); }',
+      tests,
+      runner,
+      limits: LIMITS,
+    });
+    assert.equal(bad.verdict, 'failed');
   });
 });
