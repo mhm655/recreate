@@ -50,11 +50,14 @@ tsbox -- sandboxed TypeScript execution harness
                                     is it strong enough to catch a wrong rewrite?
                                     (see "Mutation testing" in README.md)
   tsbox capture --source <file.ts> [--entry <name>] [--seed <n>] [--max-tests <n>]
-                [--mutate] [--max-mutants <n>] [--json] [--out <file.json>]
+                [--mutate] [--max-mutants <n>] [--min-mutation-score <pct>]
+                [--json] [--out <file.json>]
                                     capture the function's behaviour as a fixed,
                                     self-contained Challenge (see "Challenge data
                                     model" in README.md); --mutate also records a
-                                    mutation-testing summary on the challenge
+                                    mutation-testing summary on the challenge.
+                                    --min-mutation-score <pct> (e.g. 90) refuses to
+                                    capture below that score; implies --mutate
   tsbox preflight [--runner docker|local]
   tsbox verify-isolation            probe the container's isolation from inside it
 
@@ -197,6 +200,12 @@ function buildRunner(a: Args): SandboxRunner {
 
 function modulesFrom(a: Args): string[] {
   return a.flags.get('allow') ?? [...VENDORED_MODULES];
+}
+
+/** --min-mutation-score takes a percentage (e.g. 90), converted to the [0,1] fraction captureChallenge expects. */
+function minMutationScoreFrom(a: Args): number | undefined {
+  const pct = num(a, 'min-mutation-score');
+  return pct === undefined ? undefined : pct / 100;
 }
 
 function limitsFrom(a: Args): Partial<Limits> {
@@ -513,6 +522,7 @@ async function main(): Promise<number> {
       seed: num(args, 'seed'),
       maxTests: num(args, 'max-tests'),
       mutationTest: has(args, 'mutate') ? { maxMutants: num(args, 'max-mutants'), seed: num(args, 'seed') } : false,
+      minMutationScore: minMutationScoreFrom(args),
     });
 
     if (!result.ok) {

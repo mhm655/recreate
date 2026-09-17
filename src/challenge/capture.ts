@@ -30,6 +30,17 @@ export interface CaptureOptions {
    * authored, not implied by just wanting a suite.
    */
   mutationTest?: boolean | GenerateMutantsOptions;
+  /**
+   * Quality gate: refuses to capture a challenge whose mutation score falls below
+   * this threshold (in [0, 1]), instead of silently producing a challenge that
+   * looks identical to a strong one downstream. Setting this implies running
+   * mutation testing even if `mutationTest` was left unset -- asking for a floor
+   * on the score is asking to measure it. A source with nothing mutable (no
+   * relational/arithmetic/logical operator or literal for generateMutants to
+   * touch) has no score to fall below and passes the gate: there is nothing for a
+   * suite to have missed.
+   */
+  minMutationScore?: number;
 }
 
 export type CaptureResult = { ok: true; challenge: Challenge } | { ok: false; reason: string };
@@ -69,7 +80,7 @@ export async function captureChallenge(options: CaptureOptions): Promise<Capture
   }));
 
   let mutationTesting: ChallengeMutationSummary | undefined;
-  if (options.mutationTest) {
+  if (options.mutationTest || options.minMutationScore !== undefined) {
     const mutantOptions = typeof options.mutationTest === 'object' ? options.mutationTest : undefined;
     // precomputedOracle: the oracle was already evaluated just above; mutation
     // testing would otherwise re-run that same, most-expensive-step-in-the-pipeline
@@ -90,6 +101,18 @@ export async function captureChallenge(options: CaptureOptions): Promise<Capture
         .filter((m) => m.status === 'survived')
         .map((m) => ({ description: m.description, line: m.line, column: m.column })),
     };
+
+    if (options.minMutationScore !== undefined && mutationTesting.mutationScore !== undefined) {
+      if (mutationTesting.mutationScore < options.minMutationScore) {
+        const survivedList = mutationTesting.survived.map((s) => `line ${s.line}:${s.column} (${s.description})`).join('; ');
+        return {
+          ok: false,
+          reason:
+            `mutation score ${(mutationTesting.mutationScore * 100).toFixed(1)}% is below the required minimum ` +
+            `${(options.minMutationScore * 100).toFixed(1)}% -- survived: ${survivedList}`,
+        };
+      }
+    }
   }
 
   const challenge: Omit<Challenge, 'id'> = {

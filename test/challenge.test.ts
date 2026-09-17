@@ -79,6 +79,43 @@ describe('captureChallenge', () => {
     assert.equal(result.ok, true);
     if (result.ok) assert.equal(result.challenge.mutationTesting, undefined);
   });
+
+  it('minMutationScore implies mutation testing even when mutationTest was never set', async () => {
+    const result = await captureChallenge({ oracleSource: ORACLE, runner, limits: LIMITS, seed: 1, minMutationScore: 0.5 });
+    assert.equal(result.ok, true);
+    if (result.ok) assert.notEqual(result.challenge.mutationTesting, undefined);
+  });
+
+  it('accepts a challenge whose mutation score meets the minimum', async () => {
+    // double() scores 100% against its own generated suite -- see the live check
+    // that established this fixture.
+    const result = await captureChallenge({ oracleSource: ORACLE, runner, limits: LIMITS, seed: 1, minMutationScore: 0.9 });
+    assert.equal(result.ok, true, result.ok ? '' : result.reason);
+    if (result.ok) assert.equal(result.challenge.mutationTesting?.mutationScore, 1);
+  });
+
+  it('refuses to capture a challenge whose mutation score falls below the minimum, naming the survivor', async () => {
+    // The default parameter (48) is never exercised by a string long enough to
+    // make truncation matter, so this scores 50% against its own generated suite
+    // -- the same real gap documented in README.md's "Mutation testing" section.
+    const weakOracle = `
+      export function slugify(input: string, maxLength = 48): string {
+        return input
+          .normalize('NFKD')
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .slice(0, maxLength);
+      }
+    `;
+    const result = await captureChallenge({ oracleSource: weakOracle, runner, limits: LIMITS, seed: 3, minMutationScore: 0.9 });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /mutation score/);
+      assert.match(result.reason, /48 -> 49/);
+    }
+  });
 });
 
 describe('gradeAgainstChallenge', () => {
