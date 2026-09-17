@@ -6,7 +6,9 @@ The execution layer of a larger tool. That tool captures a real TypeScript funct
 
 This repo is **only** the sandbox and execution harness. It takes a function and a list of inputs, runs the function once per input inside an isolated sandbox, and returns each result in a lossless tagged encoding. Every failure comes back as a structured report, never as a crash or a hang of the calling process.
 
-Also here: the static analyzer that describes a function's parameters, a basic input generator built on top of it, the evaluator that grades a rewrite against a captured oracle using the same generated suite, mutation testing (checks whether a generated suite is actually strong enough to catch a wrong rewrite), and the challenge data model that freezes all of that into a single, self-contained, JSON-safe artifact so grading never again needs the oracle's source. Not built yet: the UI.
+Also here: the static analyzer that describes a function's parameters, a basic input generator built on top of it, the evaluator that grades a rewrite against a captured oracle using the same generated suite, mutation testing (checks whether a generated suite is actually strong enough to catch a wrong rewrite), and the challenge data model that freezes all of that into a single, self-contained, JSON-safe artifact so grading never again needs the oracle's source.
+
+A small local demo UI lives in [`ui/`](ui/README.md) -- a separate package that consumes this repo as an ordinary dependency, exactly the way any other consumer would. It runs against `LocalRunner` (no isolation) and exists to drive the pipeline visually, not to grade untrusted code.
 
 ---
 
@@ -396,4 +398,5 @@ docker/Dockerfile, docker/seccomp.json
 scripts/check-sandbox.sh
 test/                  unit suites, hostile pipeline suite, fixtures, tamper preload
 examples/              slugify (clean), counter (stateful), escape (rejected)
+ui/                    separate package: small React demo UI + API server (see ui/README.md)
 ```
