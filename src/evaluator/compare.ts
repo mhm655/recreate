@@ -25,18 +25,33 @@ export interface CompareResult {
 }
 
 /**
- * Test ids the oracle consistently timed out on are dropped, not scored either way
- * (README decision #4): nothing here can tell a candidate that answers fast and
- * correctly from one whose fast wrong answer never happened to time out, when the
- * oracle itself never produced a real value on that input to compare against.
+ * Test ids where the oracle consistently produced no real answer -- a timeout, a
+ * resource limit (e.g. its memory cap), or a harness error, on BOTH the ordered and
+ * shuffled pass -- are dropped, not scored either way (README decision #4): nothing
+ * here can tell a candidate that answers fast and correctly from one whose fast
+ * wrong answer never happened to hit the same wall, when the oracle itself never
+ * produced a real value on that input to compare against.
+ *
+ * This has to cover every non-return/non-thrown outcome, not just 'timeout': a pass's
+ * overall status (PassStatus in orchestrator.ts) is derived from container/process-level
+ * signals, not from any one test's outcome, so a per-test resource_limit that happens
+ * consistently on both passes leaves the oracle's overall verdict 'ok' -- and
+ * `outcomesMatch` never matches a resource_limit/harness_error outcome, even against
+ * an identical one, so leaving it in `gradedTests` would make that test slot
+ * permanently unpassable by any candidate, including one that fails identically.
  *
  * Only meaningful once `oracleReport.verdict === 'ok'` -- callers check that first.
  */
-export function dropOracleTimeouts(
+export function dropUngradableOracleOutcomes(
   oracleReport: SubmissionReport,
   tests: TestCase[],
 ): { gradedTests: TestCase[]; droppedTestIds: string[] } {
-  const droppedTestIds = tests.map((t) => t.id).filter((id) => oracleReport.results[id].outcome.type === 'timeout');
+  const droppedTestIds = tests
+    .map((t) => t.id)
+    .filter((id) => {
+      const type = oracleReport.results[id].outcome.type;
+      return type === 'timeout' || type === 'resource_limit' || type === 'harness_error';
+    });
   const gradedTests = tests.filter((t) => !droppedTestIds.includes(t.id));
   return { gradedTests, droppedTestIds };
 }
@@ -55,7 +70,7 @@ export type OracleRunResult =
  * Evaluates an oracle and prepares it for comparison: runs `evaluate()` once,
  * refuses it outright if its own verdict isn't `ok` (decision #1 -- an
  * order-sensitive "oracle" has no single right answer to grade against), then
- * drops any input it consistently timed out on (decision #4). Shared by
+ * drops any input it consistently produced no real answer for (decision #4). Shared by
  * `gradeSubmission` (grade.ts), `runMutationTests` (mutator/mutation-test.ts) and
  * `captureChallenge` (challenge/capture.ts), which all needed the identical
  * sequence and used to each run it by hand.
@@ -74,12 +89,12 @@ export async function runOracle(
     };
   }
 
-  const { gradedTests, droppedTestIds } = dropOracleTimeouts(oracleReport, tests);
+  const { gradedTests, droppedTestIds } = dropUngradableOracleOutcomes(oracleReport, tests);
   if (gradedTests.length === 0) {
     return {
       ok: false,
       oracleReport,
-      problem: { code: 'no_gradable_tests', detail: 'every test input made the oracle time out; none can be used to grade' },
+      problem: { code: 'no_gradable_tests', detail: 'every test input made the oracle time out or hit a resource limit; none can be used to grade' },
     };
   }
 
@@ -102,8 +117,12 @@ export function compareToOracle(
 
   const tests = gradedTests.map((t) => compareOne(t.id, oracleReport.results[t.id], candidateReport.results[t.id]));
   const matches = tests.filter((t) => t.result === 'match').length;
+  // Every internal caller routes through runOracle(), which already refuses an
+  // empty gradedTests before this runs -- but this is exported, so an empty list
+  // here shouldn't produce the self-contradictory "passed" with a 0% score that
+  // `matches === tests.length` (0 === 0) would otherwise give it.
   return {
-    verdict: matches === tests.length ? 'passed' : 'failed',
+    verdict: tests.length > 0 && matches === tests.length ? 'passed' : 'failed',
     score: tests.length ? matches / tests.length : 0,
     tests,
   };
@@ -123,10 +142,15 @@ export function outcomesMatch(a: Outcome, b: Outcome): boolean {
   if (a.type !== b.type) return false;
   if (a.type === 'return') return canonical(a.value) === canonical((b as typeof a).value);
   if (a.type === 'thrown') {
-    // Decision #3: match on error class plus normalised message, not exact wording
-    // or a non-Error's full encoded value.
+    // Decision #3: match on error class plus normalised message, not exact wording.
+    // When a non-Error value was thrown, `value` also carries its full encoded form
+    // (protocol.ts) specifically so two differently-shaped throws (e.g. `throw {code:42}`
+    // vs `throw {code:99}`) aren't both flattened to the same generic `String(thrown)`
+    // message and wrongly treated as a match.
     const bt = b as typeof a;
-    return a.errorClass === bt.errorClass && a.message === bt.message;
+    if (a.errorClass !== bt.errorClass || a.message !== bt.message) return false;
+    if (a.value === undefined || bt.value === undefined) return a.value === undefined && bt.value === undefined;
+    return canonical(a.value) === canonical(bt.value);
   }
   // timeout / resource_limit / harness_error: the oracle side of these never
   // reaches this function (a consistent oracle timeout is dropped before comparison,

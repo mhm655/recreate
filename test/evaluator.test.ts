@@ -76,6 +76,25 @@ describe('gradeSubmission', () => {
     assert.equal(report.tests[0].result, 'mismatch');
   });
 
+  it('fails a rewrite that throws a different plain (non-Error) value than the oracle', async () => {
+    // Regression: `describeThrown` renders a plain object's message via String(thrown),
+    // which collapses every plain object to the same "[object Object]" placeholder.
+    // The matcher used to compare only errorClass + that placeholder message, so two
+    // structurally different thrown objects were indistinguishable and silently graded
+    // as a match. Outcome.value (protocol.ts) exists specifically to keep them
+    // distinguishable; the matcher now actually uses it.
+    const oracle = 'export function f(): number { throw { code: 42 }; }';
+    const sameShape = 'export function f(): number { throw { code: 42 }; }';
+    const diffShape = 'export function f(): number { throw { code: 99 }; }';
+
+    const same = await gradeSubmission({ oracleSource: oracle, rewriteSource: sameShape, tests: [{ id: 't', args: [] }], runner, limits: LIMITS });
+    assert.equal(same.verdict, 'passed', JSON.stringify(same.problems));
+
+    const diff = await gradeSubmission({ oracleSource: oracle, rewriteSource: diffShape, tests: [{ id: 't', args: [] }], runner, limits: LIMITS });
+    assert.equal(diff.verdict, 'failed');
+    assert.equal(diff.tests[0].result, 'mismatch');
+  });
+
   it('rejects an order-sensitive oracle outright, without ever running the rewrite', async () => {
     const statefulOracle = `
       let n = 0;
@@ -111,6 +130,37 @@ describe('gradeSubmission', () => {
     assert.deepEqual(report.droppedTestIds, ['spins']);
     assert.equal(report.tests.length, 1);
     assert.equal(report.tests[0].testId, 'returns');
+  });
+
+  it('drops inputs the oracle consistently hits its memory limit on, same as a timeout', async () => {
+    // Regression: a per-test resource_limit outcome used to stay in gradedTests
+    // (only 'timeout' was dropped) even though the oracle's own two-pass verdict is
+    // 'ok' for a limit hit consistently by both passes (orchestrator.ts's PassStatus
+    // is derived from container/process signals, not from any one test's outcome).
+    // outcomesMatch() never matches a resource_limit outcome against anything, so
+    // that test slot was permanently unpassable -- even grading the oracle's exact
+    // own source against itself failed on it. This uses the same off-heap memory
+    // bomb the sandbox pipeline tests use to trigger a real RSS-watchdog resource_limit.
+    const oracle = `
+      export function grow(bomb: boolean): string {
+        if (bomb) {
+          const hoard: Uint8Array[] = [];
+          while (true) hoard.push(new Uint8Array(32 * 1024 * 1024).fill(1));
+        }
+        return 'fine';
+      }
+    `;
+    const report = await gradeSubmission({
+      oracleSource: oracle,
+      rewriteSource: oracle, // identical to the oracle -- must be able to pass
+      tests: [{ id: 'bomb', args: [true] }, { id: 'fine', args: [false] }],
+      runner,
+      limits: { perTestTimeoutMs: 2_000, passTimeoutMs: 20_000, submissionTimeoutMs: 60_000 },
+    });
+    assert.equal(report.verdict, 'passed', JSON.stringify(report.problems));
+    assert.deepEqual(report.droppedTestIds, ['bomb']);
+    assert.equal(report.tests.length, 1);
+    assert.equal(report.tests[0].testId, 'fine');
   });
 
   it('a rewrite that is itself order-sensitive ONLY on a dropped input still passes on what remains', async () => {

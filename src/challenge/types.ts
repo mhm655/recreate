@@ -55,7 +55,7 @@ export interface Challenge {
   oracleSource: string;
   allowedModules: string[];
   tests: ChallengeTest[];
-  /** Test ids the oracle consistently timed out on during capture; recorded, never graded either way (see README decision #4). */
+  /** Test ids the oracle consistently timed out or hit a resource limit on during capture; recorded, never graded either way (see README decision #4). */
   droppedTestIds: string[];
   generation: {
     seed: number;
