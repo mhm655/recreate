@@ -21,8 +21,9 @@
 import { randomUUID } from 'node:crypto';
 
 import { parseChannel } from '../channel';
-import { canonical, encodeArgs, type EncodedValue } from '../encoding';
+import { canonical, encodeArgs, hasTruncation, type EncodedValue } from '../encoding';
 import { checkSource, type Violation } from '../import-guard';
+import { mulberry32 } from '../rng';
 import {
   DEFAULT_LIMITS,
   PROTOCOL_VERSION,
@@ -194,8 +195,15 @@ export async function evaluate(options: EvaluateOptions): Promise<SubmissionRepo
 
   // --- encode arguments once, reuse for both passes ------------------------
   let encodedTests: TestInput[];
+  let truncatedInputIds: string[];
   try {
     encodedTests = options.tests.map((t) => ({ id: t.id, args: encodeArgs(t.args, limits.encode) }));
+    // The encode budget (limits.encode) can silently shorten what the caller
+    // actually specified -- e.g. an array truncated past maxCollectionEntries --
+    // before it ever reaches the sandbox. That's invisible downstream (the
+    // submission is simply graded against the shortened input), so surface it here
+    // rather than let a caller assume their test input arrived intact.
+    truncatedInputIds = encodedTests.filter((t) => hasTruncation(t.args)).map((t) => t.id);
   } catch (err) {
     return base('failed', {
       staticAnalysis,
@@ -214,35 +222,47 @@ export async function evaluate(options: EvaluateOptions): Promise<SubmissionRepo
   const grace = runner.isolated ? STARTUP_GRACE_MS.isolated : STARTUP_GRACE_MS.local;
   const perPassHostTimeout = limits.passTimeoutMs + grace;
 
-  // --- pass A: original order ---------------------------------------------
-  const passA = await runPass({
-    runId, passId: 'a', tests: encodedTests, entryName: guard.entryName,
-    code: bundled.code, limits, runner, hostTimeoutMs: perPassHostTimeout,
-  });
-
-  // --- pass B: shuffled order, fresh container, fresh worker ---------------
-  const elapsed = Date.now() - startedAt;
-  const remaining = limits.submissionTimeoutMs - elapsed;
+  // Pass B's test order doesn't depend on pass A's results -- only on the seed,
+  // computed up front -- so nothing here needs A to finish before B can start.
+  // Each pass is independently bounded by its own hostTimeoutMs (enforced by the
+  // runner: it kills the container rather than let `run()` hang), so running them
+  // concurrently via Promise.all roughly halves wall-clock time in the common case
+  // instead of paying the sum of both passes.
+  const setupElapsed = Date.now() - startedAt;
+  const remaining = limits.submissionTimeoutMs - setupElapsed;
   if (remaining <= 1_000) {
     return base('failed', {
       staticAnalysis,
-      passes: [passA],
       problems: [{
         code: 'submission_timeout',
-        detail: `submission budget of ${limits.submissionTimeoutMs}ms was exhausted by the first pass`,
+        detail: `submission budget of ${limits.submissionTimeoutMs}ms was exhausted before either pass could start`,
       }],
     });
   }
+  const perPassBudget = Math.min(perPassHostTimeout, remaining);
 
   const shuffled = shuffle(encodedTests, seed);
-  const passB = await runPass({
-    runId, passId: 'b', tests: shuffled, entryName: guard.entryName,
-    code: bundled.code, limits, runner,
-    hostTimeoutMs: Math.min(perPassHostTimeout, remaining),
-  });
+  const [passA, passB] = await Promise.all([
+    runPass({
+      runId, passId: 'a', tests: encodedTests, entryName: guard.entryName,
+      code: bundled.code, limits, runner, hostTimeoutMs: perPassBudget,
+    }),
+    runPass({
+      runId, passId: 'b', tests: shuffled, entryName: guard.entryName,
+      code: bundled.code, limits, runner, hostTimeoutMs: perPassBudget,
+    }),
+  ]);
 
   // --- compare -------------------------------------------------------------
   const problems: Problem[] = [];
+  if (truncatedInputIds.length) {
+    problems.push({
+      code: 'test_input_truncated',
+      detail:
+        `${truncatedInputIds.length} test(s) had an argument shortened by the encode budget before ` +
+        `reaching the sandbox, and were graded against that shortened input: ${truncatedInputIds.slice(0, 10).join(', ')}`,
+    });
+  }
   if (!runner.isolated) {
     problems.push({
       code: 'no_isolation',
@@ -583,18 +603,6 @@ function validateTestIds(tests: TestCase[]): Problem[] {
     }
   }
   return problems;
-}
-
-/** Deterministic PRNG, so a reported seed reproduces the exact shuffle. */
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
 }
 
 export function shuffle<T>(items: readonly T[], seed: number): T[] {

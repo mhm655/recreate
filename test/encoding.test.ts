@@ -134,6 +134,27 @@ describe('encoding: primitives and built-ins', () => {
     assert.equal((enc as any).ctor, 'Point');
   });
 
+  it('tags dropped symbol-keyed properties instead of silently losing them', () => {
+    const sym = Symbol('secret');
+    const obj = { visible: 1, [sym]: 'hidden' };
+    const enc = encode(obj);
+    assert.equal(enc.t, 'object');
+    const entries = (enc as { v: Array<[string, unknown]> }).v;
+    assert.ok(entries.some(([k]) => k === '__droppedSymbolKeys'), JSON.stringify(entries));
+
+    // And the marker must not leak into the decoded object as a real property.
+    const decoded = decode(enc) as Record<string, unknown>;
+    assert.equal(decoded.visible, 1);
+    assert.equal('__droppedSymbolKeys' in decoded, false);
+
+    const arr: unknown[] = [1, 2];
+    (arr as unknown as Record<symbol, unknown>)[sym] = 'hidden';
+    const arrEnc = encode(arr) as { props?: Array<[string, unknown]> };
+    assert.ok(arrEnc.props?.some(([k]) => k === '__droppedSymbolKeys'), JSON.stringify(arrEnc.props));
+    const decodedArr = decode(arrEnc as never) as unknown[];
+    assert.equal((decodedArr as unknown as Record<string, unknown>)['__droppedSymbolKeys'], undefined);
+  });
+
   it('marks functions without trying to serialise their code', () => {
     const enc = encode(function namedThing() {});
     assert.deepEqual(enc, { t: 'fn', i: 0, name: 'namedThing', cls: false });

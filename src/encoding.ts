@@ -274,6 +274,8 @@ class Encoder {
       }
       props.push([key, this.encodeProperty(arr, key, depth)]);
     }
+    const symbolKeys = safeOwnSymbolKeys(arr).length;
+    if (symbolKeys) props.push(['__droppedSymbolKeys', { t: 'num', v: symbolKeys }]);
 
     const node: any = { t: 'array', i, v: out };
     if (holes.length) node.holes = holes;
@@ -290,6 +292,11 @@ class Encoder {
       }
       entries.push([key, this.encodeProperty(value, key, depth)]);
     }
+    // Object.getOwnPropertyNames (safeOwnKeys) never returns symbol-keyed
+    // properties. Every other lossy path here (accessor/unsupported/truncated)
+    // carries an explicit tag; this one gets a count instead of vanishing silently.
+    const symbolKeys = safeOwnSymbolKeys(value).length;
+    if (symbolKeys) entries.push(['__droppedSymbolKeys', { t: 'num', v: symbolKeys }]);
     const node: any = { t: 'object', i, v: entries };
     let proto: unknown;
     try {
@@ -394,6 +401,14 @@ function safeTag(v: unknown): string {
 function safeOwnKeys(o: object): string[] {
   try {
     return ownKeys(o);
+  } catch {
+    return [];
+  }
+}
+
+function safeOwnSymbolKeys(o: object): symbol[] {
+  try {
+    return Object.getOwnPropertySymbols(o);
   } catch {
     return [];
   }
@@ -589,7 +604,7 @@ class Decoder {
           arr[k] = this.decode(enc.v[k]);
         }
         for (const [key, val] of enc.props ?? []) {
-          if (key === '__truncatedLength' || key === '__truncatedKeys') continue;
+          if (key === '__truncatedLength' || key === '__truncatedKeys' || key === '__droppedSymbolKeys') continue;
           arr[key] = this.decode(val);
         }
         return arr;
@@ -600,7 +615,7 @@ class Decoder {
           enc.proto === 'null' ? R.Object.create(null) : new R.Object(),
         );
         for (const [key, val] of enc.v) {
-          if (key === '__truncatedKeys') continue;
+          if (key === '__truncatedKeys' || key === '__droppedSymbolKeys') continue;
           try {
             obj[key] = this.decode(val);
           } catch {
@@ -680,4 +695,36 @@ class Decoder {
  */
 export function canonical(enc: EncodedValue): string {
   return JSON.stringify(enc);
+}
+
+/**
+ * True if any node in `enc` lost data to a budget cap: a `{t:'truncated'}` marker,
+ * a string cut short (`trunc` set), or a `__truncatedLength`/`__truncatedKeys`
+ * marker hung off an array/object. Used on the INPUT side (test arguments encoded
+ * before being sent into the sandbox) to detect when the encode budget silently
+ * shortened what the caller actually specified -- see src/host/orchestrator.ts.
+ */
+export function hasTruncation(enc: EncodedValue): boolean {
+  switch (enc.t) {
+    case 'truncated':
+      return true;
+    case 'str':
+      return enc.trunc !== undefined;
+    case 'array':
+      return (
+        (enc.props?.some(([k]) => k === '__truncatedLength' || k === '__truncatedKeys') ?? false) ||
+        enc.v.some(hasTruncation) ||
+        (enc.props?.some(([, v]) => hasTruncation(v)) ?? false)
+      );
+    case 'object':
+      return enc.v.some(([k, v]) => k === '__truncatedKeys' || hasTruncation(v));
+    case 'error':
+      return enc.props?.some(([, v]) => hasTruncation(v)) ?? false;
+    case 'map':
+      return enc.v.some(([k, v]) => hasTruncation(k) || hasTruncation(v));
+    case 'set':
+      return enc.v.some(hasTruncation);
+    default:
+      return false;
+  }
 }

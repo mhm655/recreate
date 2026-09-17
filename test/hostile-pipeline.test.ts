@@ -321,6 +321,28 @@ describe('hostile: values JSON cannot represent', () => {
 
 // ---------------------------------------------------------------------------
 
+describe('input truncation', () => {
+  it('a test argument shortened by the encode budget is reported, not silently graded', async () => {
+    const report = await run(
+      'export function len(arr: number[]): number { return arr.length; }',
+      [
+        { id: 'small', args: [[1, 2, 3]] },
+        { id: 'big', args: [Array.from({ length: 5_000 }, (_, i) => i)] },
+      ],
+      { limits: { ...LIMITS, encode: { ...DEFAULT_LIMITS.encode, maxCollectionEntries: 1_000 } } },
+    );
+    assert.equal(report.verdict, 'ok', explain(report));
+    assert.ok(
+      report.problems.some((p) => p.code === 'test_input_truncated' && p.detail.includes('big')),
+      JSON.stringify(report.problems),
+    );
+    assert.equal(report.problems.some((p) => p.code === 'test_input_truncated' && p.detail.includes('small')), false);
+    // The submission is graded against what actually arrived: the truncated array.
+    assert.equal(returned(report.results.big), 1_000);
+    assert.equal(returned(report.results.small), 3);
+  });
+});
+
 describe('hostile: argument mutation', () => {
   it('argsAfterCall captures a function mutating its own inputs', async () => {
     const report = await run(H.MUTATES_ARGS, [{ id: 'mutate', args: [[3, 1, 2], {}] }]);

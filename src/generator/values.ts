@@ -15,7 +15,7 @@
  * silently narrow what the harness can grade beyond what the analyzer itself decided.
  */
 
-import type { PropertyShape, TupleElement, TypeShape } from '../analyzer/types';
+import type { TypeShape } from '../analyzer/types';
 import type { Rng } from './rng';
 
 export interface ValueBudget {
@@ -71,11 +71,35 @@ export function valuesFor(shape: TypeShape, rng: Rng, budget: ValueBudget = DEFA
       );
     }
 
-    case 'tuple':
-      return cap(rng, [buildTuple(shape.elements, rng, budget, depth), buildTuple(shape.elements, rng, budget, depth)], budget);
+    case 'tuple': {
+      // Value set per element computed ONCE, then picked from twice -- same pattern
+      // as array/map/set below. Building it inline here (rather than reusing
+      // buildTuple twice) avoids recursing into every element's shape a second time.
+      const elementSets = shape.elements.map((el) => valuesFor(el.type, rng, budget, depth + 1));
+      const build = () =>
+        shape.elements.flatMap((el, idx) => {
+          if (el.rest) {
+            const vals = elementSets[idx];
+            return [rng.pick(vals), rng.pick(vals)];
+          }
+          if (el.optional && rng.next() < 0.3) return [];
+          return [rng.pick(elementSets[idx])];
+        });
+      return cap(rng, [build(), build()], budget);
+    }
 
-    case 'object':
-      return cap(rng, [buildObject(shape.properties, rng, budget, depth, true), buildObject(shape.properties, rng, budget, depth, false)], budget);
+    case 'object': {
+      const propSets = shape.properties.map((p) => valuesFor(p.type, rng, budget, depth + 1));
+      const build = (includeOptional: boolean): Record<string, unknown> => {
+        const obj: Record<string, unknown> = {};
+        shape.properties.forEach((p, idx) => {
+          if (p.optional && !includeOptional) return;
+          obj[p.name] = rng.pick(propSets[idx]);
+        });
+        return obj;
+      };
+      return cap(rng, [build(true), build(false)], budget);
+    }
 
     case 'union': {
       const perMember = Math.max(1, Math.floor(budget.maxPerShape / Math.max(1, shape.members.length)));
@@ -132,29 +156,6 @@ function cap(rng: Rng, values: readonly unknown[], budget: ValueBudget): unknown
 function uniqueSizes(max: number): number[] {
   const sizes = new Set([0, 1, max]);
   return [...sizes].filter((n) => n >= 0);
-}
-
-function buildTuple(elements: readonly TupleElement[], rng: Rng, budget: ValueBudget, depth: number): unknown[] {
-  const out: unknown[] = [];
-  for (const el of elements) {
-    if (el.rest) {
-      const vals = valuesFor(el.type, rng, budget, depth + 1);
-      out.push(rng.pick(vals), rng.pick(vals));
-      continue;
-    }
-    if (el.optional && rng.next() < 0.3) continue;
-    out.push(rng.pick(valuesFor(el.type, rng, budget, depth + 1)));
-  }
-  return out;
-}
-
-function buildObject(properties: readonly PropertyShape[], rng: Rng, budget: ValueBudget, depth: number, includeOptional: boolean): Record<string, unknown> {
-  const obj: Record<string, unknown> = {};
-  for (const p of properties) {
-    if (p.optional && !includeOptional) continue;
-    obj[p.name] = rng.pick(valuesFor(p.type, rng, budget, depth + 1));
-  }
-  return obj;
 }
 
 const TYPED_ARRAY_CTORS: Record<string, new (values: number[]) => unknown> = {

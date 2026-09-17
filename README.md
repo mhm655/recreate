@@ -42,7 +42,7 @@ flowchart LR
 
 ### Why each pass gets a fresh container
 
-Both passes run the whole test list, pass A in the original order and pass B in a seeded shuffle. Each pass gets **its own container and its own worker**, so state can't leak between passes through module scope, prototypes or the tmpfs.
+Both passes run the whole test list, pass A in the original order and pass B in a seeded shuffle. Each pass gets **its own container and its own worker**, so state can't leak between passes through module scope, prototypes or the tmpfs. The two passes run **concurrently** (`Promise.all`), not one after the other -- nothing about pass B depends on pass A's results, only on the seed, so there is no reason to pay the sum of both passes' wall time instead of the max of the two.
 
 Within a pass, one worker runs every test **on purpose**. Module-level counters, memo caches and prototype pollution are *meant* to persist between tests there, because that leakage is exactly what comparing the two passes detects. Any test whose outcome or post-call arguments differ between passes sets the verdict to `nondeterministic`. The report records no single answer for it.
 
