@@ -64,3 +64,13 @@ export interface ChallengeGradeReport {
   tests: ChallengeTestVerdict[];
   problems: Problem[];
 }
+
+/** What GET /api/challenges returns per entry -- see ui/server/store.ts. */
+export interface ChallengeSummary {
+  id: string;
+  entryName: string;
+  testCount: number;
+  droppedCount: number;
+  mutationScore?: number;
+  capturedAt: string;
+}

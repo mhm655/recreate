@@ -145,6 +145,14 @@ td {
   border-bottom: 1px solid #2a2e37;
 }
 
+tr.active-row {
+  background: #16233a;
+}
+
+tr.active-row td {
+  color: #7fb2ff;
+}
+
 details summary {
   cursor: pointer;
   font-size: 0.85rem;

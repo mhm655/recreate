@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import type { CaptureResult, Challenge, ChallengeGradeReport, Outcome } from './types';
+import { useEffect, useState } from 'react';
+import type { CaptureResult, Challenge, ChallengeGradeReport, ChallengeSummary } from './types';
+import { summarizeOutcome } from './summarize';
 
 const EXAMPLE_ORACLE = `export function slugify(input: string, maxLength = 48): string {
   return input
@@ -11,21 +12,11 @@ const EXAMPLE_ORACLE = `export function slugify(input: string, maxLength = 48): 
     .slice(0, maxLength);
 }`;
 
-function summarizeOutcome(o: Outcome): string {
-  switch (o.type) {
-    case 'return':
-      return `returned ${JSON.stringify(o.value)}`;
-    case 'thrown':
-      return `threw ${o.errorClass}: ${o.message}`;
-    case 'timeout':
-      return `timed out after ${o.limitMs}ms`;
-    case 'resource_limit':
-      return `resource limit (${o.limit}): ${o.detail}`;
-    case 'harness_error':
-      return `harness error: ${o.detail}`;
-    default:
-      return 'unknown outcome';
-  }
+async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error ?? json.reason ?? `request failed (${res.status})`);
+  return json as T;
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
@@ -74,6 +65,36 @@ export default function App() {
   const [gradeError, setGradeError] = useState<string | null>(null);
   const [grade, setGrade] = useState<ChallengeGradeReport | null>(null);
 
+  const [saved, setSaved] = useState<ChallengeSummary[]>([]);
+  const [savedError, setSavedError] = useState<string | null>(null);
+  const [loadingId, setLoadingId] = useState<string | null>(null);
+
+  async function refreshSaved() {
+    try {
+      setSaved(await getJson<ChallengeSummary[]>('/api/challenges'));
+      setSavedError(null);
+    } catch (err) {
+      setSavedError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  useEffect(() => {
+    void refreshSaved();
+  }, []);
+
+  async function onLoadSaved(id: string) {
+    setLoadingId(id);
+    setCaptureError(null);
+    setGrade(null);
+    try {
+      setChallenge(await getJson<Challenge>(`/api/challenges/${id}`));
+    } catch (err) {
+      setCaptureError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoadingId(null);
+    }
+  }
+
   async function onCapture() {
     setCapturing(true);
     setCaptureError(null);
@@ -91,6 +112,7 @@ export default function App() {
         return;
       }
       setChallenge(result.challenge);
+      void refreshSaved();
     } catch (err) {
       setCaptureError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -179,7 +201,41 @@ export default function App() {
       </section>
 
       <section className="card">
-        <h2>2. Grade a rewrite</h2>
+        <h2>2. Or load a saved challenge</h2>
+        {savedError && <p className="error">{savedError}</p>}
+        {saved.length === 0 && !savedError && <p className="hint">None captured yet.</p>}
+        {saved.length > 0 && (
+          <table>
+            <thead>
+              <tr>
+                <th>entry</th>
+                <th>tests</th>
+                <th>mutation score</th>
+                <th>captured</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {saved.map((s) => (
+                <tr key={s.id} className={s.id === challenge?.id ? 'active-row' : undefined}>
+                  <td>{s.entryName}</td>
+                  <td>{s.testCount}</td>
+                  <td>{s.mutationScore === undefined ? '-' : `${(s.mutationScore * 100).toFixed(0)}%`}</td>
+                  <td>{new Date(s.capturedAt).toLocaleString()}</td>
+                  <td>
+                    <button onClick={() => onLoadSaved(s.id)} disabled={loadingId === s.id}>
+                      {loadingId === s.id ? 'Loading...' : s.id === challenge?.id ? 'Loaded' : 'Load'}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section className="card">
+        <h2>3. Grade a rewrite</h2>
         {!challenge && <p className="hint">Capture a challenge above first.</p>}
         <label>
           Rewrite source (TypeScript)
