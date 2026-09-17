@@ -15,6 +15,7 @@ import type { FunctionAnalysis } from './analyzer/types';
 import { checkSource } from './import-guard';
 import { VENDORED_MODULES } from './bundle';
 import { generateTests } from './generator/generate';
+import { gradeSubmission, type GradeReport } from './evaluator/grade';
 import { DockerRunner } from './host/docker-runner';
 import { LocalRunner, type SandboxRunner } from './host/runner';
 import { evaluate, type SubmissionReport } from './host/orchestrator';
@@ -33,6 +34,11 @@ tsbox -- sandboxed TypeScript execution harness
                                     generate a test-input suite for the function
                                     (see "Static analyzer" / "Input generation" in
                                     README.md); prints a summary unless --json/--out
+  tsbox grade --oracle <file.ts> --rewrite <file.ts> --tests <file.json> [options]
+                                    grade a rewrite against a captured oracle,
+                                    using the same tests against both (see
+                                    "Evaluator" in README.md); --tests may be a
+                                    file 'generate --out' produced, or hand-written
   tsbox preflight [--runner docker|local]
   tsbox verify-isolation            probe the container's isolation from inside it
 
@@ -259,6 +265,24 @@ function summarize(outcome: SubmissionReport['passes'][number]['results'][number
   }
 }
 
+function renderGrade(report: GradeReport): string {
+  const lines: string[] = [];
+  const mark = { passed: 'PASSED', failed: 'FAILED', oracle_invalid: 'ORACLE INVALID', rewrite_invalid: 'REWRITE INVALID' };
+  lines.push(`verdict : ${mark[report.verdict]}`);
+  lines.push(`score   : ${(report.score * 100).toFixed(1)}% (${report.tests.filter((t) => t.result === 'match').length}/${report.tests.length})`);
+  if (report.droppedTestIds.length) {
+    lines.push(`dropped : ${report.droppedTestIds.length} test(s) the oracle itself timed out on: ${report.droppedTestIds.join(', ')}`);
+  }
+  for (const p of report.problems) lines.push(`  ! ${p.code}: ${p.detail}`);
+  for (const t of report.tests) {
+    if (t.result === 'match') continue;
+    lines.push(`  MISMATCH ${t.testId}: ${t.reason}`);
+    lines.push(`      oracle : ${summarize(t.oracle.outcome)}`);
+    lines.push(`      rewrite: ${summarize(t.rewrite.outcome)}`);
+  }
+  return lines.join('\n');
+}
+
 // --- generate: plain-JSON conversion ---------------------------------------
 
 function sentinelForSpecialNumber(n: number): string | undefined {
@@ -345,6 +369,33 @@ async function main(): Promise<number> {
     }
     process.stdout.write(failed ? `\n${failed} isolation check(s) FAILED\n` : '\nall isolation checks passed\n');
     return failed ? 1 : 0;
+  }
+
+  if (args.command === 'grade') {
+    const oraclePath = one(args, 'oracle');
+    const rewritePath = one(args, 'rewrite');
+    const testsPath = one(args, 'tests');
+    if (!oraclePath) throw new Error('--oracle is required');
+    if (!rewritePath) throw new Error('--rewrite is required');
+    if (!testsPath) throw new Error('--tests is required');
+
+    const oracleSource = fs.readFileSync(path.resolve(oraclePath), 'utf8');
+    const rewriteSource = fs.readFileSync(path.resolve(rewritePath), 'utf8');
+    const { tests, entryName } = loadTests(path.resolve(testsPath));
+
+    const report = await gradeSubmission({
+      oracleSource,
+      rewriteSource,
+      tests,
+      entryName: one(args, 'entry') ?? entryName,
+      allowedModules: args.flags.get('allow') ?? VENDORED_MODULES,
+      limits: limitsFrom(args),
+      runner: buildRunner(args),
+      seed: num(args, 'seed'),
+    });
+
+    process.stdout.write(has(args, 'json') ? `${JSON.stringify(report, null, 2)}\n` : `${renderGrade(report)}\n`);
+    return report.verdict === 'passed' ? 0 : 1;
   }
 
   const sourcePath = one(args, 'source');

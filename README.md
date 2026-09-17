@@ -6,7 +6,7 @@ The execution layer of a larger tool. That tool captures a real TypeScript funct
 
 This repo is **only** the sandbox and execution harness. It takes a function and a list of inputs, runs the function once per input inside an isolated sandbox, and returns each result in a lossless tagged encoding. Every failure comes back as a structured report, never as a crash or a hang of the calling process.
 
-Also here: the static analyzer that describes a function's parameters, and a basic input generator built on top of it. Not built yet: the evaluator, mutation testing, the challenge data model, the UI.
+Also here: the static analyzer that describes a function's parameters, a basic input generator built on top of it, and the evaluator that grades a rewrite against a captured oracle using the same generated suite. Not built yet: mutation testing (nothing yet checks whether a generated suite is actually strong enough to catch a wrong rewrite), the challenge data model, the UI.
 
 ---
 
@@ -217,6 +217,24 @@ node dist/src/cli.js generate --source examples/slugify.ts --out tests.json     
 - **Deterministic.** A seeded PRNG (`src/generator/rng.ts`) drives every choice, so the same source and seed always produce the same suite.
 - **Refuses exactly what the analyzer would refuse.** `generateTests` checks `generatability.generatable` up front and returns the blockers as the reason, never attempting to fabricate a callback, a `Promise`, or a class instance. A shape the analyzer marks merely weak (`any`, `unknown`, an unconstrained generic, or `recursive`, its own cut-off marker for a self-referential type) gets a small set of generic fallback values instead of being refused -- refusing there would silently narrow what the harness can grade beyond what the analyzer itself decided.
 - **The CLI's plain-JSON test format is a strict subset of what the generator can produce.** `--tests` files (see Usage) only round-trip primitives, plain arrays/objects, and the four numeric-sentinel specials. `Date`, `Map`, `Set`, `RegExp`, typed arrays and `bigint` -- all things a real signature can legitimately require -- have no representation there. `tsbox generate` reports and skips any test that needs one rather than writing something that looks valid but isn't; call `generateTests` + `evaluate()` directly from the JS API to run those.
+- **Suite quality is not yet validated.** The generator produces a *plausible* set of edge cases, not a *proven-adequate* one -- nothing here checks whether the suite it built would actually catch a wrong rewrite of the function it was generated from. (Concretely: an earlier version of the string edge-case list had no mixed-case example, so a rewrite that silently dropped `.toLowerCase()` passed a full generated suite undetected, until a real end-to-end grading run against a deliberately buggy rewrite surfaced the gap.) That validation is what mutation testing (see the top of this file) is for, and it doesn't exist yet.
+
+---
+
+## Evaluator
+
+`src/evaluator/` grades a rewrite against a captured oracle, running both through `evaluate()` against the *same* test list and diffing the results. It runs on the host; every actual execution still goes through the same sandboxed, two-pass pipeline as any other submission -- this layer only decides what "correct" means once both reports come back.
+
+```bash
+node dist/src/cli.js grade --oracle original.ts --rewrite candidate.ts --tests tests.json
+```
+
+`tests.json` can be a file `tsbox generate --out` wrote, or hand-written in the same format as `run --tests`.
+
+- **The oracle is graded too, implicitly.** `gradeSubmission` runs the oracle through `evaluate()` first. If its own verdict isn't `ok`, grading stops there with `oracle_invalid` and the rewrite is never even run -- an order-sensitive "oracle" has no single right answer to grade against (decision #1), and there is nothing useful to say about a rewrite compared to a source that itself couldn't be evaluated.
+- **Inputs the oracle times out on are dropped, not scored either way** (decision #4). Nothing here can tell a rewrite that answers fast and correctly from one whose fast wrong answer never happened to time out, if the oracle itself never produced a real value on that input to compare against. Dropped ids are reported separately (`GradeReport.droppedTestIds`) rather than silently absorbed into the score.
+- **A rewrite that fails its own two-pass run never gets diffed per test.** If the rewrite's own `evaluate()` verdict isn't `ok` (rejected by static analysis, order-sensitive, or an incomplete run), the whole grade is `rewrite_invalid` with the reason attached -- there is no single result set to compare item-by-item.
+- **Matching rule.** A `return` matches on the canonical form of the encoded value (structural equality, tag-for-tag). A `thrown` matches on error class plus normalised message, not exact wording (decision #3). Anything else -- a timeout, a resource limit, a harness error, or a `return`/`thrown` type mismatch -- is always a mismatch; the rewrite didn't produce a real answer to compare.
 
 ---
 
@@ -337,6 +355,7 @@ src/
   host/orchestrator.ts two passes, reconciliation, comparison, report
   analyzer/            static signature/type analysis for input generation (host, no execution)
   generator/           input generation from FunctionAnalysis (host, no execution)
+  evaluator/           grades a rewrite against an oracle via evaluate() (host)
   cli.ts
 docker/Dockerfile, docker/seccomp.json
 scripts/check-sandbox.sh

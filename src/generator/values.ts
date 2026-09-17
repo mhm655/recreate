@@ -41,7 +41,11 @@ export function valuesFor(shape: TypeShape, rng: Rng, budget: ValueBudget = DEFA
 
   switch (shape.kind) {
     case 'string':
-      return cap(rng, ['', 'a', 'hello world', 'a'.repeat(64), '  spaced  \t\n', "quote's\"and\\backslash", 'émoji 🎉'], budget);
+      return cap(
+        rng,
+        ['', 'a', 'Hello World', 'MIXED-Case_123', 'a'.repeat(64), '  spaced  \t\n', "quote's\"and\\backslash", 'émoji 🎉'],
+        budget,
+      );
     case 'number':
       return cap(rng, [0, 1, -1, 42, -0.5, 3.14159, Number.MAX_SAFE_INTEGER, Number.MIN_SAFE_INTEGER, NaN, Infinity, -Infinity], budget);
     case 'boolean':
