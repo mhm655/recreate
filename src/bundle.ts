@@ -28,7 +28,7 @@ import * as esbuild from 'esbuild';
  * as part of every submission that imports it. Vet the package (and its own
  * dependencies, since esbuild will pull those in too) before adding it.
  */
-export const VENDORED_MODULES: readonly string[] = ['lodash-es'];
+export const VENDORED_MODULES: readonly string[] = ['lodash-es', 'date-fns', 'ms'];
 
 export type BundleResult = { ok: true; code: string } | { ok: false; detail: string };
 

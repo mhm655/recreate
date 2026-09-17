@@ -503,6 +503,42 @@ describe('vendored dependencies', () => {
     ]);
     assert.equal(report.verdict, 'rejected', explain(report));
   });
+
+  it('runs a vendored ES module dependency (date-fns) end to end', async () => {
+    const source = `
+      import { addDays, formatISO } from 'date-fns';
+      export function shiftDate(iso: string, days: number): string {
+        return formatISO(addDays(new Date(iso), days), { representation: 'date' });
+      }
+    `;
+    const report = await run(source, [
+      { id: 'forward', args: ['2024-01-01', 10] },
+      { id: 'backward', args: ['2024-12-25', -5] },
+    ]);
+    assert.equal(report.verdict, 'ok', explain(report));
+    assert.equal(returned(report.results.forward), '2024-01-11');
+    assert.equal(returned(report.results.backward), '2024-12-20');
+  });
+
+  it('runs a vendored legacy-CommonJS dependency (ms) via a default import', async () => {
+    // Regression: `ms` exports via `module.exports = fn`, not a real ES module --
+    // a default import of it used to transpile into code reading a `.default`
+    // property that doesn't exist, throwing "is not a function" at runtime. Fixed
+    // by enabling esModuleInterop in src/transpile.ts.
+    const source = `
+      import ms from 'ms';
+      export function toSeconds(input: string): number {
+        return ms(input) / 1000;
+      }
+    `;
+    const report = await run(source, [
+      { id: 'days', args: ['2 days'] },
+      { id: 'hours', args: ['1h'] },
+    ]);
+    assert.equal(report.verdict, 'ok', explain(report));
+    assert.equal(returned(report.results.days), 172_800);
+    assert.equal(returned(report.results.hours), 3_600);
+  });
 });
 
 describe('function and class-instance arguments', () => {

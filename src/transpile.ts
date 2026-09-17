@@ -31,6 +31,15 @@ export function transpileSubmission(source: string): TranspileResult {
         isolatedModules: true,
         sourceMap: false,
         inlineSourceMap: false,
+        // Without this, `import x from 'mod'` compiles to code that reads
+        // `mod_1.default`, which only exists on a real ES module. A legacy
+        // CommonJS dependency (`module.exports = fn`, no `.default`) -- like the
+        // vendored `ms` package -- would transpile fine and then throw
+        // "is not a function" at runtime. esModuleInterop wraps a plain CJS
+        // export in `{ default: ... }` via TS's standard `__importDefault`
+        // helper, exactly as any real-world TS project consuming both ESM and
+        // CJS dependencies already needs.
+        esModuleInterop: true,
       },
     });
     const errors = (out.diagnostics ?? []).filter((d) => d.category === ts.DiagnosticCategory.Error);

@@ -305,7 +305,7 @@ The allowlist only permits a module *statically*. Making an allowed module *avai
 
 ### Vendored dependencies
 
-A submission can `import` a small, explicit set of vetted npm packages -- currently just `lodash-es` -- listed in `VENDORED_MODULES` (`src/bundle.ts`). Adding one there is a supply-chain decision, not a config toggle: the package's code runs, inlined, as part of every submission that imports it, so vet it (and its own dependencies) first.
+A submission can `import` a small, explicit set of vetted npm packages -- `lodash-es`, `date-fns`, `ms` -- listed in `VENDORED_MODULES` (`src/bundle.ts`). Adding one there is a supply-chain decision, not a config toggle: the package's code runs, inlined, as part of every submission that imports it, so vet it (and its own dependencies) first.
 
 **How it stays consistent with "no node_modules in the image, no runtime require":** after the host transpiles a submission to CommonJS (as it always has), `bundleSubmission` runs esbuild over that output with `bundle: true`, resolving vendored specifiers against the *host's* `node_modules` and inlining them. The worker never sees a `require` of anything real -- it gets one self-contained script, same as before this feature existed. A test (`every vendored module is actually installed`, in `test/bundle.test.ts`) fails the build if `VENDORED_MODULES` ever lists something not actually in `package.json`.
 
@@ -314,6 +314,8 @@ Only modules that pass `checkSource`'s allowlist reach the bundler at all, so a 
 **Known cost:** `lodash-es`'s own module graph is not fully tree-shakeable by esbuild (its internals share state through a single `lodash.js` object), so importing even one function currently inlines most of the library (tens of KB). That's a size/startup cost, not a correctness or security one; a future version could switch to per-function `lodash-es/<fn>.js` imports or a different vetted library if that cost matters.
 
 **One realm quirk this surfaced:** `lodash-es`'s root-detection code falls back to `Function('return this')()` when it can't find `global` or `self`. The vm context (`src/sandbox/worker.ts`) disables string code generation, so that fallback would throw. The fix is a one-line alias, `globalThis.global = globalThis`, added to the context before any submission code runs -- it does not add a capability, since `global` here is just another name for the same restricted realm.
+
+**One interop bug adding `date-fns` and `ms` surfaced:** `date-fns` (a real ES module) worked immediately; `ms` is legacy CommonJS (`module.exports = fn`, no `.default`), and `import ms from 'ms'` transpiled into code reading a `.default` property that plain CJS modules don't have -- it threw `"is not a function"` at runtime despite transpiling and bundling cleanly. `src/transpile.ts` never set `esModuleInterop`, so TypeScript's usual handling for exactly this case (wrapping a plain CJS export as `{ default: ... }` via its `__importDefault` helper) never ran. Fixed by enabling it there; verified against both a named-export (`lodash-es`, `date-fns`) and a default-import (`ms`) dependency so the fix covers both shapes, not just the one that broke.
 
 ---
 

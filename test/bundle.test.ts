@@ -57,6 +57,36 @@ describe('bundleSubmission', () => {
     assert.deepEqual(Array.from(moduleObj.exports.firstPair?.([1, 2, 3, 4]) ?? []), [1, 2]);
   });
 
+  it('inlines a legacy-CommonJS vendored dependency (ms) accessed via a default import', async () => {
+    const source = `
+      import ms from 'ms';
+      export function toSeconds(input: string): number {
+        return ms(input) / 1000;
+      }
+    `;
+    const guard = checkSource(source, { allowedModules: VENDORED_MODULES });
+    assert.equal(guard.ok, true);
+    if (!guard.ok) return;
+
+    const transpiled = transpileSubmission(source);
+    assert.equal(transpiled.ok, true);
+    if (!transpiled.ok) return;
+
+    const bundled = await bundleSubmission(transpiled.code, guard.referencedModules);
+    assert.equal(bundled.ok, true);
+    if (!bundled.ok) return;
+    assert.ok(!/require\(\s*["']ms["']\s*\)/.test(bundled.code));
+
+    const moduleObj = { exports: {} as { toSeconds?: (input: string) => number } };
+    const context = vm.createContext(
+      { module: moduleObj, exports: moduleObj.exports },
+      { codeGeneration: { strings: false, wasm: false } },
+    );
+    vm.runInContext('globalThis.global = globalThis', context);
+    vm.runInContext(bundled.code, context);
+    assert.equal(moduleObj.exports.toSeconds?.('2 days'), 172_800);
+  });
+
   it('rejects a specifier outside the allowlist before bundling is ever reached', () => {
     const guard = checkSource("import { z } from 'left-pad'; export function f() { return z; }", {
       allowedModules: VENDORED_MODULES,
