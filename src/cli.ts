@@ -10,6 +10,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
+import { describeEncoded } from './encoding';
 import { analyzeIsolated } from './analyzer/isolated';
 import type { FunctionAnalysis } from './analyzer/types';
 import { checkSource } from './import-guard';
@@ -90,20 +91,38 @@ Test input file
   Write "@@@@x" for a literal "@@x".
 `;
 
-interface Args {
+export interface Args {
   command: string;
   flags: Map<string, string[]>;
 }
 
-function parseArgs(argv: string[]): Args {
+const KNOWN_COMMANDS = new Set([
+  'help', 'preflight', 'verify-isolation', 'grade', 'capture', 'analyze', 'generate', 'check', 'mutate', 'run',
+]);
+
+/** Flags that are pure presence switches (`has(args, k)`) and never take a value. */
+const BOOLEAN_FLAGS = new Set(['help', 'json', 'mutate', 'unsafe-local', 'unsafe-runtime']);
+
+export function parseArgs(argv: string[]): Args {
   const command = argv[0] && !argv[0].startsWith('-') ? argv[0] : 'help';
   const flags = new Map<string, string[]>();
   for (let i = command === 'help' ? 0 : 1; i < argv.length; i++) {
     const token = argv[i];
     if (!token.startsWith('--')) continue;
     const key = token.slice(2);
-    const next = argv[i + 1];
-    const value = next && !next.startsWith('--') ? (i++, next) : 'true';
+    let value: string;
+    if (BOOLEAN_FLAGS.has(key)) {
+      value = 'true';
+    } else {
+      const next = argv[i + 1];
+      // A missing or flag-shaped next token used to silently become the literal
+      // string 'true' here -- e.g. a dangling `--allow` at the end of argv turned
+      // into an allowlist of ["true"], rejecting every real module with a confusing
+      // "(allowed: true)" message instead of a clear complaint about `--allow` itself.
+      if (next === undefined || next.startsWith('--')) throw new Error(`--${key} requires a value`);
+      value = next;
+      i++;
+    }
     const list = flags.get(key) ?? [];
     list.push(value);
     flags.set(key, list);
@@ -153,6 +172,13 @@ function loadTests(file: string): { tests: TestCase[]; entryName?: string } {
   const tests = body.tests.map((raw, index) => {
     const t = raw as { id?: unknown; args?: unknown };
     const id = typeof t.id === 'string' ? t.id : `t${index + 1}`;
+    // A missing "args" defaults to a zero-argument call, but a present-and-wrong-type
+    // one (e.g. an object instead of an array, from a typo) used to be silently
+    // coerced to the same [] -- turning a malformed test file into a confusing
+    // wrong-answer report instead of a clear error naming the actual test id.
+    if (t.args !== undefined && !Array.isArray(t.args)) {
+      throw new Error(`${file}: test '${id}' has an "args" that is not an array`);
+    }
     const args = Array.isArray(t.args) ? (liftSentinels(t.args) as unknown[]) : [];
     return { id, args };
   });
@@ -198,8 +224,12 @@ function buildRunner(a: Args): SandboxRunner {
   });
 }
 
-function modulesFrom(a: Args): string[] {
-  return a.flags.get('allow') ?? [...VENDORED_MODULES];
+/** USAGE documents --allow as "Add a module to the import allowlist (repeatable)" --
+ * it must extend the vendored defaults, not replace them, or a user adding one
+ * module they need silently loses permission for lodash-es/date-fns/ms too. */
+export function modulesFrom(a: Args): string[] {
+  const extra = a.flags.get('allow') ?? [];
+  return [...new Set([...VENDORED_MODULES, ...extra])];
 }
 
 /** --min-mutation-score takes a percentage (e.g. 90), converted to the [0,1] fraction captureChallenge expects. */
@@ -303,7 +333,7 @@ function render(report: SubmissionReport): string {
 
 function summarize(outcome: SubmissionReport['passes'][number]['results'][number]['outcome']): string {
   switch (outcome.type) {
-    case 'return': return `returned ${JSON.stringify(outcome.value)}`.slice(0, 160);
+    case 'return': return `returned ${describeEncoded(outcome.value)}`.slice(0, 160);
     case 'thrown': return `threw ${outcome.errorClass}: ${outcome.message}`.slice(0, 160);
     case 'timeout': return `TIMEOUT after ${outcome.limitMs}ms (worker terminated)`;
     case 'resource_limit': return `RESOURCE LIMIT (${outcome.limit}): ${outcome.detail}`;
@@ -318,7 +348,7 @@ function renderGrade(report: GradeReport): string {
   lines.push(`verdict : ${mark[report.verdict]}`);
   lines.push(`score   : ${(report.score * 100).toFixed(1)}% (${report.tests.filter((t) => t.result === 'match').length}/${report.tests.length})`);
   if (report.droppedTestIds.length) {
-    lines.push(`dropped : ${report.droppedTestIds.length} test(s) the oracle itself timed out on: ${report.droppedTestIds.join(', ')}`);
+    lines.push(`dropped : ${report.droppedTestIds.length} test(s) the oracle couldn't produce a real answer for (timeout/resource limit): ${report.droppedTestIds.join(', ')}`);
   }
   for (const p of report.problems) lines.push(`  ! ${p.code}: ${p.detail}`);
   for (const t of report.tests) {
@@ -339,7 +369,7 @@ function renderMutation(report: MutationTestReport): string {
   );
   if (report.inconclusiveCount) lines.push(`inconclusive   : ${report.inconclusiveCount} (mutant itself never ran; doesn't count either way)`);
   if (report.droppedTestIds.length) {
-    lines.push(`dropped        : ${report.droppedTestIds.length} test(s) the oracle itself timed out on: ${report.droppedTestIds.join(', ')}`);
+    lines.push(`dropped        : ${report.droppedTestIds.length} test(s) the oracle couldn't produce a real answer for (timeout/resource limit): ${report.droppedTestIds.join(', ')}`);
   }
   for (const p of report.problems) lines.push(`  ! ${p.code}: ${p.detail}`);
   for (const m of report.mutants) {
@@ -368,7 +398,7 @@ function renderChallengeSummary(challenge: Challenge): string {
   const lines: string[] = [];
   lines.push(`challenge '${challenge.id}' for '${challenge.entryName}'`);
   lines.push(`  tests   : ${challenge.tests.length}`);
-  if (challenge.droppedTestIds.length) lines.push(`  dropped : ${challenge.droppedTestIds.length} (oracle timed out): ${challenge.droppedTestIds.join(', ')}`);
+  if (challenge.droppedTestIds.length) lines.push(`  dropped : ${challenge.droppedTestIds.length} (oracle couldn't answer -- timeout/resource limit): ${challenge.droppedTestIds.join(', ')}`);
   if (challenge.mutationTesting) {
     const m = challenge.mutationTesting;
     lines.push(`  mutation score : ${m.mutationScore === undefined ? 'n/a' : `${(m.mutationScore * 100).toFixed(1)}%`} (${m.killedCount} killed / ${m.killedCount + m.survivedCount} scoreable)`);
@@ -436,6 +466,11 @@ async function main(): Promise<number> {
     process.stdout.write(`${USAGE}\n`);
     return 0;
   }
+
+  // Checked up front so a typo'd command (e.g. `tsbox frobnicate`) is reported as
+  // such, rather than as a misleading "--source is required" from the fallthrough
+  // path below when no --source happens to be given either.
+  if (!KNOWN_COMMANDS.has(args.command)) throw new Error(`unknown command '${args.command}'`);
 
   if (args.command === 'preflight') {
     const runner = buildRunner(args);
@@ -619,7 +654,10 @@ async function main(): Promise<number> {
       );
     }
     if (outPath) process.stdout.write(`wrote ${testsOut.length} test(s) to ${outPath}\n`);
-    return 0;
+    // A script relying on the exit code alone should be able to tell "generated
+    // nothing usable" from success, even though the file/stdout payload alone
+    // (an empty tests array) looks the same either way.
+    return testsOut.length === 0 && skipped.length > 0 ? 1 : 0;
   }
 
   if (args.command === 'check') {
@@ -655,10 +693,15 @@ async function main(): Promise<number> {
     });
 
     process.stdout.write(has(args, 'json') ? `${JSON.stringify(report, null, 2)}\n` : `${renderMutation(report)}\n`);
-    return report.problems.length === 0 && report.survivedCount === 0 ? 0 : 1;
+    // 'no_mutants' (nothing in the oracle was mutable) isn't a failure: captureChallenge's
+    // own minMutationScore gate treats the same condition as passing -- there is
+    // nothing for the suite to have missed. Any OTHER problem still fails the command.
+    const hardProblems = report.problems.filter((p) => p.code !== 'no_mutants');
+    return hardProblems.length === 0 && report.survivedCount === 0 ? 0 : 1;
   }
 
-  if (args.command !== 'run') throw new Error(`unknown command '${args.command}'`);
+  // Only 'run' can reach here: every other name in KNOWN_COMMANDS returned above,
+  // and anything not in KNOWN_COMMANDS was already rejected up front.
 
   const testsPath = one(args, 'tests');
   if (!testsPath) throw new Error('--tests is required');
