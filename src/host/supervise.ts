@@ -130,9 +130,11 @@ export async function supervisePass(opts: {
 
     const attemptStartedAt = Date.now();
     const watcher = new ResultStreamWatcher();
+    let attemptRawOutput = '';
     const spawned = opts.spawnAttempt(remaining, generation);
     spawned.onResultData((chunk) => watcher.feed(chunk));
     spawned.onRawData((chunk) => {
+      attemptRawOutput += chunk;
       if (rawOutput.length < opts.limits.maxRawOutputBytes) rawOutput += chunk;
     });
 
@@ -168,7 +170,17 @@ export async function supervisePass(opts: {
     // worker_threads' `resourceLimits` option used to. V8 does print a recognisable
     // message before it dies, which is the only way left to tell "hit its heap cap"
     // apart from any other reason the process might have died.
-    const v8HeapOom = killReason === null && /heap out of memory|FATAL ERROR: Reached heap limit/i.test(rawOutput);
+    //
+    // Checked regardless of killReason, not just when the process died on its own:
+    // V8 printing the message and actually exiting is a race against our OWN
+    // silence-timeout (killReason === 'silence'/'rss'), and on a slower host V8 can
+    // still be in the middle of dying -- has already written the message to stderr,
+    // just hasn't exited yet -- when our timeout fires and we SIGKILL it first. The
+    // message having appeared at all is a strictly more informative signal than "we
+    // gave up waiting", so it takes precedence. (rawOutput is already documented
+    // elsewhere as diagnostic-only, never part of the correctness verdict; using it
+    // as a weak heuristic for outcome classification is consistent with that.)
+    const v8HeapOom = /heap out of memory|FATAL ERROR: Reached heap limit/i.test(attemptRawOutput);
     const outcome: Outcome =
       last.oomKilled || killReason === 'rss' || v8HeapOom
         ? { type: 'resource_limit', limit: 'memory', detail: `sandbox exceeded its memory budget while running '${inFlight.id}'` }

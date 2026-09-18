@@ -122,7 +122,19 @@ describe('hostile: memory bombs', () => {
     assert.equal(report.verdict, 'ok', explain(report));
   });
 
-  it('off-heap growth that a heartbeat can catch mid-loop is caught by the RSS watchdog', async () => {
+  // Both fixtures below are fully synchronous loops (no `await`/yield point), so
+  // they never give the host's heartbeat mechanism a chance to see them coming --
+  // see README.md's Security model section on why that's now the only way (short
+  // of a container's own OOMKilled flag) to catch memory growth from outside a
+  // single-process sandbox. Honest limitation, not a bug: under LocalRunner (no
+  // cgroup to inspect afterward) this is caught as a plain timeout; under
+  // DockerRunner, the container's own cgroup limit kills it and OOMKilled inspection
+  // (src/host/docker-runner.ts) recovers the precise resource_limit/memory
+  // attribution -- strictly better than the old design's own-process RSS polling,
+  // since it's enforced by the kernel rather than self-reported.
+  const expectedMemoryOutcomeType = USE_DOCKER ? 'resource_limit' : 'timeout';
+
+  it('a fully synchronous off-heap bomb mid-test is caught, precisely under DockerRunner and safely under LocalRunner', async () => {
     const report = await run(H.OFF_HEAP_BOMB, [
       { id: 'bomb', args: [true] },
       { id: 'after-bomb', args: [false] },
@@ -131,45 +143,29 @@ describe('hostile: memory bombs', () => {
       assert.equal(pass.status, 'ok', explain(report));
       const results = byId(pass.results);
       const bomb = results.get('bomb')!.outcome;
-      // Regression note: this fixture's loop is fully synchronous (no `await`/yield
-      // point), so it never actually gives the host's heartbeat mechanism a chance to
-      // see it coming -- see the next test for what that means honestly. This test
-      // still passed under the OLD worker-thread design (a live sibling thread could
-      // poll RSS regardless of whether the busy loop itself ever yielded), so its
-      // outcome type changed from resource_limit/memory to timeout; kept here as a
-      // deliberate marker of that precision loss, not a bug.
-      assert.equal(bomb.type, 'timeout', JSON.stringify(bomb));
+      assert.equal(bomb.type, expectedMemoryOutcomeType, JSON.stringify(bomb));
+      if (bomb.type === 'resource_limit') assert.equal(bomb.limit, 'memory');
       assert.equal(returned(results.get('after-bomb')), 'fine');
     }
     assert.equal(report.verdict, 'ok', explain(report));
   });
 
-  it(
-    'a fully synchronous off-heap bomb is caught as a timeout, not attributed to memory, under LocalRunner',
-    async () => {
-      // Honest limitation, not a bug: with no privileged thread left alive inside
-      // the sandbox to poll its own RSS (see README.md's Security model section),
-      // the host can only detect memory growth via the sandbox's own heartbeat
-      // self-reports, OR (for DockerRunner only) by inspecting the container's
-      // OOMKilled flag after the fact. A loop with no `await`/yield point ever
-      // returns to the event loop, so it never sends a heartbeat either -- from the
-      // host's side this is indistinguishable from any other hang, and LocalRunner
-      // has no cgroup to inspect after killing it. DockerRunner gets the precise
-      // attribution back (see 'container-level limits' below); this documents the
-      // honest, safe-but-less-precise fallback for the unsandboxed dev runner.
-      const report = await run(H.OFF_HEAP_BOMB_AT_MODULE_SCOPE, [
-        { id: 'a', args: [] },
-        { id: 'b', args: [] },
-      ]);
-      for (const pass of report.passes) {
-        assert.equal(pass.status, 'ok', explain(report));
-        for (const r of pass.results) {
-          assert.equal(r.outcome.type, 'timeout', JSON.stringify(r.outcome));
-        }
+  it('a fully synchronous off-heap bomb at module scope, before any test runs, is caught the same way', async () => {
+    // Every fresh sandbox attempt re-runs this module-level loop during compile(),
+    // so every test in the pass independently hits it and needs its own attempt.
+    const report = await run(H.OFF_HEAP_BOMB_AT_MODULE_SCOPE, [
+      { id: 'a', args: [] },
+      { id: 'b', args: [] },
+    ]);
+    for (const pass of report.passes) {
+      assert.equal(pass.status, 'ok', explain(report));
+      for (const r of pass.results) {
+        assert.equal(r.outcome.type, expectedMemoryOutcomeType, JSON.stringify(r.outcome));
+        if (r.outcome.type === 'resource_limit') assert.equal(r.outcome.limit, 'memory');
       }
-      assert.equal(report.verdict, 'ok', explain(report));
-    },
-  );
+    }
+    assert.equal(report.verdict, 'ok', explain(report));
+  });
 });
 
 // ---------------------------------------------------------------------------
