@@ -53,12 +53,18 @@ export type EncodedValue =
       holes?: number[];
       /** Non-index own string keys hung off the array. */
       props?: Array<[string, EncodedValue]>;
+      /** Real array length exceeded budget.maxCollectionEntries; `v` holds only the first N. */
+      truncatedLength?: number;
+      /** Own string keys (props, for array; v, for object/error) exceeded budget.maxKeys; only some are included. */
+      truncatedKeys?: true;
+      /** Count of own symbol-keyed properties dropped entirely -- no representation at all, unlike everything else here. */
+      droppedSymbolKeys?: number;
     }
-  | { t: 'object'; i: number; v: Array<[string, EncodedValue]>; ctor?: string; proto?: 'null' }
+  | { t: 'object'; i: number; v: Array<[string, EncodedValue]>; ctor?: string; proto?: 'null'; truncatedKeys?: true; droppedSymbolKeys?: number }
   /** `v === null` means an Invalid Date. */
   | { t: 'date'; i: number; v: string | null }
   | { t: 'regexp'; i: number; source: string; flags: string }
-  | { t: 'error'; i: number; name: string; message: string; props?: Array<[string, EncodedValue]> }
+  | { t: 'error'; i: number; name: string; message: string; props?: Array<[string, EncodedValue]>; truncatedKeys?: true; droppedSymbolKeys?: number }
   | { t: 'map'; i: number; v: Array<[EncodedValue, EncodedValue]> }
   | { t: 'set'; i: number; v: EncodedValue[] }
   | { t: 'typedarray'; i: number; kind: string; b64: string; trunc?: number }
@@ -214,14 +220,33 @@ const ownDescriptor = Object.getOwnPropertyDescriptor;
 const getProto = Object.getPrototypeOf;
 const isArray = Array.isArray;
 
+/**
+ * A node-count budget shared across multiple otherwise-independent Encoder
+ * instances. `recordCalls` needs each recorded entry's `args` encoded by its own
+ * fresh Encoder (own `nextIndex`/`seen`, starting the index numbering at 0 -- see
+ * the comment where this is used below), but that must NOT mean each one gets its
+ * own fresh `maxNodes` allowance too, or a large recordCalls table could do up to
+ * `maxCollectionEntries` times as much encoding work as `maxNodes` is meant to cap
+ * for the whole document. Sharing this counter bounds the TOTAL work while leaving
+ * each sub-encode's indexing independent.
+ */
+class NodeBudget {
+  count = 0;
+}
+
 class Encoder {
-  private nodes = 0;
+  private readonly nodeBudget: NodeBudget;
   private nextIndex = 0;
   private readonly seen = new Map<unknown, number>();
-  constructor(private readonly budget: EncodeBudget) {}
+  constructor(
+    private readonly budget: EncodeBudget,
+    nodeBudget: NodeBudget = new NodeBudget(),
+  ) {
+    this.nodeBudget = nodeBudget;
+  }
 
   encode(value: unknown, depth = 0): EncodedValue {
-    if (this.nodes++ >= this.budget.maxNodes) return { t: 'truncated', reason: 'nodes' };
+    if (this.nodeBudget.count++ >= this.budget.maxNodes) return { t: 'truncated', reason: 'nodes' };
 
     switch (typeof value) {
       case 'undefined':
@@ -270,15 +295,19 @@ class Encoder {
         // the cap gets the same clear "no recorded result" failure as one the
         // caller never recorded at all.
         (node as { recorded?: RecordedCallEntry[] }).recorded = raw.slice(0, this.budget.maxCollectionEntries).map((call) => ({
-          // encodeArgs, NOT this.encode: it's compared later via canonical() against
-          // a call's live arguments, ALSO encoded via a fresh encodeArgs() call (see
-          // the decoder's 'fn' case below). canonical()'s output embeds each node's
-          // index, which is only stable within one standalone encode -- reusing
-          // this ambient, already-partway-through-the-document encoder here would
-          // give the same logical arguments a different index purely because of
-          // where in the document this entry happens to sit, and the comparison
-          // would never match even for genuinely identical arguments.
-          args: encodeArgs(call.args, this.budget),
+          // A fresh Encoder (own nextIndex/seen), NOT this.encode: it's compared
+          // later via canonical() against a call's live arguments, ALSO encoded via
+          // a fresh encode (see the decoder's 'fn' case below). canonical()'s output
+          // embeds each node's index, which is only stable within one standalone
+          // encode -- reusing this ambient, already-partway-through-the-document
+          // encoder's INDEXING here would give the same logical arguments a
+          // different index purely because of where in the document this entry
+          // happens to sit, and the comparison would never match even for
+          // genuinely identical arguments. The node-count BUDGET is a separate
+          // concern, and IS shared (this.nodeBudget) -- otherwise a large recorded
+          // table could do maxCollectionEntries times as much encoding work as
+          // maxNodes is meant to cap for the whole document.
+          args: new Encoder(this.budget, this.nodeBudget).encode(call.args.slice()),
           ...(call.outcome.type === 'return'
             ? { type: 'return' as const, value: this.encode(call.outcome.value, depth + 1) }
             : { type: 'thrown' as const, errorClass: clamp(call.outcome.errorClass, 200), message: normalizeErrorMessage(call.outcome.message) }),
@@ -367,33 +396,41 @@ class Encoder {
       }
     }
 
+    // Non-index own string keys (e.g. `const a = [1]; a.tag = 'x'`). Truncation/drop
+    // markers live in dedicated fields on the node (below), NOT as fake entries
+    // mixed into `props` -- a real property actually named e.g. '__truncatedKeys'
+    // would otherwise be indistinguishable from the marker and silently dropped
+    // by decode().
     const props: Array<[string, EncodedValue]> = [];
-    if (len > limit) props.push(['__truncatedLength', { t: 'num', v: len }]);
-
-    // Non-index own string keys (e.g. `const a = [1]; a.tag = 'x'`).
+    let truncatedKeys = false;
     for (const key of safeOwnKeys(arr)) {
       if (key === 'length') continue;
       if (/^(0|[1-9][0-9]*)$/.test(key) && Number(key) < len) continue;
       if (props.length >= this.budget.maxKeys) {
-        props.push(['__truncatedKeys', { t: 'truncated', reason: 'keys' }]);
+        truncatedKeys = true;
         break;
       }
       props.push([key, this.encodeProperty(arr, key, depth)]);
     }
     const symbolKeys = safeOwnSymbolKeys(arr).length;
-    if (symbolKeys) props.push(['__droppedSymbolKeys', { t: 'num', v: symbolKeys }]);
 
     const node: any = { t: 'array', i, v: out };
     if (holes.length) node.holes = holes;
     if (props.length) node.props = props;
+    if (len > limit) node.truncatedLength = len;
+    if (truncatedKeys) node.truncatedKeys = true;
+    if (symbolKeys) node.droppedSymbolKeys = symbolKeys;
     return node as EncodedValue;
   }
 
   private encodeObject(value: object, i: number, depth: number, tag: string): EncodedValue {
+    // See encodeArray's comment: truncation/drop markers are dedicated fields on
+    // the node, never fake entries mixed into `v`.
     const entries: Array<[string, EncodedValue]> = [];
+    let truncatedKeys = false;
     for (const key of safeOwnKeys(value)) {
       if (entries.length >= this.budget.maxKeys) {
-        entries.push(['__truncatedKeys', { t: 'truncated', reason: 'keys' }]);
+        truncatedKeys = true;
         break;
       }
       entries.push([key, this.encodeProperty(value, key, depth)]);
@@ -402,7 +439,6 @@ class Encoder {
     // properties. Every other lossy path here (accessor/unsupported/truncated)
     // carries an explicit tag; this one gets a count instead of vanishing silently.
     const symbolKeys = safeOwnSymbolKeys(value).length;
-    if (symbolKeys) entries.push(['__droppedSymbolKeys', { t: 'num', v: symbolKeys }]);
     const node: any = { t: 'object', i, v: entries };
     let proto: unknown;
     try {
@@ -414,6 +450,8 @@ class Encoder {
     const ctor = safeConstructorName(proto);
     if (ctor && ctor !== 'Object') node.ctor = ctor;
     else if (!ctor && proto !== null && tag !== '[object Object]') node.ctor = tag.slice(8, -1);
+    if (truncatedKeys) node.truncatedKeys = true;
+    if (symbolKeys) node.droppedSymbolKeys = symbolKeys;
     return node as EncodedValue;
   }
 
@@ -439,19 +477,23 @@ class Encoder {
     };
     // Own extras (e.g. `err.code`), minus the noisy standard fields. `stack` is
     // excluded on purpose: it embeds absolute paths and line numbers, so including
-    // it would make every run look different from every other run.
+    // it would make every run look different from every other run. See
+    // encodeArray's comment: truncation/drop markers are dedicated fields on the
+    // node, never fake entries mixed into `props`.
     const props: Array<[string, EncodedValue]> = [];
+    let truncatedKeys = false;
     const keys = safeOwnKeys(value as object).filter((k) => k !== 'stack' && k !== 'message' && k !== 'name');
     for (const key of keys) {
       if (props.length >= this.budget.maxKeys) {
-        props.push(['__truncatedKeys', { t: 'truncated', reason: 'keys' }]);
+        truncatedKeys = true;
         break;
       }
       props.push([key, this.encodeProperty(value as object, key, depth)]);
     }
     const symbolKeys = safeOwnSymbolKeys(value as object).length;
-    if (symbolKeys) props.push(['__droppedSymbolKeys', { t: 'num', v: symbolKeys }]);
     if (props.length) node.props = props;
+    if (truncatedKeys) node.truncatedKeys = true;
+    if (symbolKeys) node.droppedSymbolKeys = symbolKeys;
     return node as EncodedValue;
   }
 
@@ -772,7 +814,6 @@ class Decoder {
           arr[k] = this.decode(enc.v[k]);
         }
         for (const [key, val] of enc.props ?? []) {
-          if (key === '__truncatedLength' || key === '__truncatedKeys' || key === '__droppedSymbolKeys') continue;
           arr[key] = this.decode(val);
         }
         return arr;
@@ -783,7 +824,6 @@ class Decoder {
           enc.proto === 'null' ? R.Object.create(null) : new R.Object(),
         );
         for (const [key, val] of enc.v) {
-          if (key === '__truncatedKeys' || key === '__droppedSymbolKeys') continue;
           try {
             obj[key] = this.decode(val);
           } catch {
@@ -806,7 +846,6 @@ class Decoder {
         }
         this.register(enc.i, err);
         for (const [key, val] of enc.props ?? []) {
-          if (key === '__truncatedKeys' || key === '__droppedSymbolKeys') continue;
           try {
             err[key] = this.decode(val);
           } catch {
@@ -868,8 +907,8 @@ export function canonical(enc: EncodedValue): string {
 
 /**
  * True if any node in `enc` lost data to a budget cap: a `{t:'truncated'}` marker,
- * a string/typed-array/arraybuffer cut short (`trunc` set), or a
- * `__truncatedLength`/`__truncatedKeys` marker hung off an array/object/error. Used
+ * a string/typed-array/arraybuffer cut short (`trunc` set), or a `truncatedLength`/
+ * `truncatedKeys`/`droppedSymbolKeys` field set on an array/object/error node. Used
  * on the INPUT side (test arguments encoded before being sent into the sandbox) to
  * detect when the encode budget silently shortened what the caller actually
  * specified -- see src/host/orchestrator.ts.
@@ -884,15 +923,18 @@ export function hasTruncation(enc: EncodedValue): boolean {
       return enc.trunc !== undefined;
     case 'array':
       return (
-        (enc.props?.some(([k]) => k === '__truncatedLength' || k === '__truncatedKeys') ?? false) ||
+        enc.truncatedLength !== undefined ||
+        enc.truncatedKeys === true ||
+        enc.droppedSymbolKeys !== undefined ||
         enc.v.some(hasTruncation) ||
         (enc.props?.some(([, v]) => hasTruncation(v)) ?? false)
       );
     case 'object':
-      return enc.v.some(([k, v]) => k === '__truncatedKeys' || hasTruncation(v));
+      return enc.truncatedKeys === true || enc.droppedSymbolKeys !== undefined || enc.v.some(([, v]) => hasTruncation(v));
     case 'error':
       return (
-        (enc.props?.some(([k]) => k === '__truncatedKeys') ?? false) ||
+        enc.truncatedKeys === true ||
+        enc.droppedSymbolKeys !== undefined ||
         (enc.props?.some(([, v]) => hasTruncation(v)) ?? false)
       );
     case 'map':
@@ -904,7 +946,14 @@ export function hasTruncation(enc: EncodedValue): boolean {
   }
 }
 
-const RESERVED_MARKER_KEYS = new Set(['__truncatedLength', '__truncatedKeys', '__droppedSymbolKeys']);
+/** Human-readable notes for an array/object/error node's truncation fields, if any. */
+function truncationNotes(enc: { truncatedLength?: number; truncatedKeys?: true; droppedSymbolKeys?: number; v?: unknown[] }): string[] {
+  const notes: string[] = [];
+  if (enc.truncatedLength !== undefined && enc.v) notes.push(`showing first ${enc.v.length} of ${enc.truncatedLength}`);
+  if (enc.truncatedKeys) notes.push('more keys truncated');
+  if (enc.droppedSymbolKeys) notes.push(`${enc.droppedSymbolKeys} symbol key(s) dropped`);
+  return notes;
+}
 
 /**
  * Human-readable rendering of a tagged `EncodedValue`, for surfacing a test outcome
@@ -954,21 +1003,27 @@ export function describeEncoded(enc: EncodedValue, seen: Set<number> = new Set()
       if (seen.has(enc.i)) return '<circular reference>';
       const next = new Set(seen).add(enc.i);
       const items = enc.v.map((v) => describeEncoded(v, next));
-      const extra = (enc.props ?? []).filter(([k]) => !RESERVED_MARKER_KEYS.has(k)).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
-      return `[${[...items, ...extra].join(', ')}]`;
+      const extra = (enc.props ?? []).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
+      const body = `[${[...items, ...extra].join(', ')}]`;
+      const notes = truncationNotes(enc);
+      return notes.length ? `${body} (${notes.join(', ')})` : body;
     }
     case 'object': {
       if (seen.has(enc.i)) return '<circular reference>';
       const next = new Set(seen).add(enc.i);
-      const entries = enc.v.filter(([k]) => !RESERVED_MARKER_KEYS.has(k)).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
+      const entries = enc.v.map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
       const prefix = enc.ctor && enc.ctor !== 'Object' ? `${enc.ctor} ` : '';
-      return `${prefix}{${entries.join(', ')}}`;
+      const body = `${prefix}{${entries.join(', ')}}`;
+      const notes = truncationNotes(enc);
+      return notes.length ? `${body} (${notes.join(', ')})` : body;
     }
     case 'error': {
       if (seen.has(enc.i)) return '<circular reference>';
       const next = new Set(seen).add(enc.i);
-      const extra = (enc.props ?? []).filter(([k]) => !RESERVED_MARKER_KEYS.has(k)).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
-      return `${enc.name}(${JSON.stringify(enc.message)})${extra.length ? ` {${extra.join(', ')}}` : ''}`;
+      const extra = (enc.props ?? []).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
+      const body = `${enc.name}(${JSON.stringify(enc.message)})${extra.length ? ` {${extra.join(', ')}}` : ''}`;
+      const notes = truncationNotes(enc);
+      return notes.length ? `${body} (${notes.join(', ')})` : body;
     }
     case 'map': {
       if (seen.has(enc.i)) return '<circular reference>';

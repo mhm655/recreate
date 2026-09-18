@@ -10,6 +10,7 @@ import {
   describeEncoded,
   encode,
   encodeArgs,
+  hasTruncation,
   normalizeErrorMessage,
   recordCalls,
   type EncodedValue,
@@ -139,22 +140,53 @@ describe('encoding: primitives and built-ins', () => {
   it('tags dropped symbol-keyed properties instead of silently losing them', () => {
     const sym = Symbol('secret');
     const obj = { visible: 1, [sym]: 'hidden' };
-    const enc = encode(obj);
+    const enc = encode(obj) as Extract<EncodedValue, { t: 'object' }>;
     assert.equal(enc.t, 'object');
-    const entries = (enc as { v: Array<[string, unknown]> }).v;
-    assert.ok(entries.some(([k]) => k === '__droppedSymbolKeys'), JSON.stringify(entries));
+    assert.equal(enc.droppedSymbolKeys, 1);
 
-    // And the marker must not leak into the decoded object as a real property.
     const decoded = decode(enc) as Record<string, unknown>;
     assert.equal(decoded.visible, 1);
-    assert.equal('__droppedSymbolKeys' in decoded, false);
 
     const arr: unknown[] = [1, 2];
     (arr as unknown as Record<symbol, unknown>)[sym] = 'hidden';
-    const arrEnc = encode(arr) as { props?: Array<[string, unknown]> };
-    assert.ok(arrEnc.props?.some(([k]) => k === '__droppedSymbolKeys'), JSON.stringify(arrEnc.props));
-    const decodedArr = decode(arrEnc as never) as unknown[];
-    assert.equal((decodedArr as unknown as Record<string, unknown>)['__droppedSymbolKeys'], undefined);
+    const arrEnc = encode(arr) as Extract<EncodedValue, { t: 'array' }>;
+    assert.equal(arrEnc.droppedSymbolKeys, 1);
+    const decodedArr = decode(arrEnc) as unknown[];
+    assert.deepEqual(decodedArr, [1, 2]);
+  });
+
+  it('a real own property named like a reserved marker key survives round-trip intact -- it is not a real marker', () => {
+    // Regression: truncation/drop bookkeeping used to be embedded as fake
+    // [key, value] entries directly inside the same array that held real
+    // properties (`__truncatedKeys`, `__truncatedLength`, `__droppedSymbolKeys`),
+    // indistinguishable in the wire format from a real property of the same name.
+    // decode() unconditionally skipped any entry with one of those exact keys, so
+    // a submission's own property that happened to share a name silently
+    // vanished. Those markers are now dedicated fields on the node instead.
+    const obj = { __truncatedKeys: 'a real value', __droppedSymbolKeys: 42, __truncatedLength: 'also real' };
+    assert.deepEqual(decode(encode(obj)), obj);
+
+    const arr: unknown[] = [1, 2];
+    (arr as unknown as Record<string, unknown>).__truncatedKeys = 'still real';
+    assert.equal((decode(encode(arr)) as unknown as Record<string, unknown>).__truncatedKeys, 'still real');
+
+    const err = new Error('boom') as Error & Record<string, unknown>;
+    err.__droppedSymbolKeys = 'also still real';
+    assert.equal((decode(encode(err)) as unknown as Record<string, unknown>).__droppedSymbolKeys, 'also still real');
+  });
+
+  it('records array length/key truncation as dedicated node fields, not entries mixed into real data', () => {
+    const budget = { maxNodes: 1000, maxDepth: 32, maxStringLength: 100, maxKeys: 2, maxCollectionEntries: 3 };
+    const big = Array.from({ length: 10 }, (_, i) => i);
+    (big as unknown as Record<string, number>).a = 1;
+    (big as unknown as Record<string, number>).b = 2;
+    (big as unknown as Record<string, number>).c = 3;
+    const enc = encode(big, budget) as Extract<EncodedValue, { t: 'array' }>;
+    assert.equal(enc.truncatedLength, 10);
+    assert.equal(enc.v.length, 3);
+    assert.equal(enc.truncatedKeys, true);
+    assert.equal(enc.props?.length, 2);
+    assert.ok(hasTruncation(enc));
   });
 
   it('marks functions without trying to serialise their code', () => {
@@ -231,6 +263,28 @@ describe('encoding: recordCalls (bounded callback support)', () => {
   it('a bare (unrecorded) function argument still throws exactly as before -- recordCalls is opt-in, not a behaviour change', () => {
     const decoded = roundTrip(function bareCallback() {}) as () => void;
     assert.throws(() => decoded(), /cannot be reconstructed inside the sandbox/);
+  });
+
+  it('each recorded entry\'s args draws from the SAME node budget as the rest of the document, not a fresh one per entry', () => {
+    // Regression: each recorded entry's `args` used to be encoded by a brand-new
+    // Encoder with its own untouched maxNodes allowance (needed for its own
+    // independent index numbering -- see the code comment where this is built),
+    // so a recordCalls table could do up to maxCollectionEntries times as much
+    // encoding work as maxNodes is meant to cap for the WHOLE document. A tiny
+    // shared budget makes the fix observable directly: the fn node itself and the
+    // first couple of entries consume it, and every entry after that shows up
+    // truncated -- which could never happen if each entry got a fresh budget.
+    const budget = { maxNodes: 5, maxDepth: 32, maxStringLength: 100, maxKeys: 100, maxCollectionEntries: 10 };
+    const inputs = Array.from({ length: 5 }, (_, i) => [i] as [number]);
+    const wrapped = recordCalls((x: number) => x, inputs);
+    const enc = encode(wrapped, budget) as Extract<EncodedValue, { t: 'fn' }>;
+    const recorded = enc.recorded!;
+    assert.equal(recorded.length, 5);
+    assert.equal(recorded[0].args.t, 'array', 'the first entry should still encode fully');
+    assert.ok(
+      recorded.some((entry) => entry.args.t === 'truncated'),
+      `expected at least one entry to run out of the shared budget: ${JSON.stringify(recorded)}`,
+    );
   });
 });
 

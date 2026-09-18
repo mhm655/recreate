@@ -1,6 +1,13 @@
 import type { EncodedValue, Outcome } from './types';
 
-const RESERVED_MARKER_KEYS = new Set(['__truncatedLength', '__truncatedKeys', '__droppedSymbolKeys']);
+/** Human-readable notes for an array/object/error node's truncation fields, if any. */
+function truncationNotes(enc: EncodedValue): string[] {
+  const notes: string[] = [];
+  if (enc.truncatedLength !== undefined && Array.isArray(enc.v)) notes.push(`showing first ${(enc.v as unknown[]).length} of ${enc.truncatedLength}`);
+  if (enc.truncatedKeys) notes.push('more keys truncated');
+  if (typeof enc.droppedSymbolKeys === 'number' && enc.droppedSymbolKeys > 0) notes.push(`${enc.droppedSymbolKeys} symbol key(s) dropped`);
+  return notes;
+}
 
 /**
  * Human-readable rendering of a tagged EncodedValue (the harness's wire format --
@@ -52,23 +59,23 @@ function describeEncoded(enc: EncodedValue, seen: Set<number> = new Set()): stri
       return `ArrayBuffer(${enc.trunc !== undefined ? `truncated from ${enc.trunc} bytes` : `${(enc.b64 as string).length} base64 chars`})`;
     case 'array': {
       const items = ((enc.v as EncodedValue[]) ?? []).map((v) => describeEncoded(v, next));
-      const extra = ((enc.props as Array<[string, EncodedValue]>) ?? [])
-        .filter(([k]) => !RESERVED_MARKER_KEYS.has(k))
-        .map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
-      return `[${[...items, ...extra].join(', ')}]`;
+      const extra = ((enc.props as Array<[string, EncodedValue]>) ?? []).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
+      const body = `[${[...items, ...extra].join(', ')}]`;
+      const notes = truncationNotes(enc);
+      return notes.length ? `${body} (${notes.join(', ')})` : body;
     }
     case 'object': {
-      const entries = ((enc.v as Array<[string, EncodedValue]>) ?? [])
-        .filter(([k]) => !RESERVED_MARKER_KEYS.has(k))
-        .map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
+      const entries = ((enc.v as Array<[string, EncodedValue]>) ?? []).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
       const prefix = enc.ctor && enc.ctor !== 'Object' ? `${enc.ctor} ` : '';
-      return `${prefix}{${entries.join(', ')}}`;
+      const body = `${prefix}{${entries.join(', ')}}`;
+      const notes = truncationNotes(enc);
+      return notes.length ? `${body} (${notes.join(', ')})` : body;
     }
     case 'error': {
-      const extra = ((enc.props as Array<[string, EncodedValue]>) ?? [])
-        .filter(([k]) => !RESERVED_MARKER_KEYS.has(k))
-        .map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
-      return `${enc.name}(${JSON.stringify(enc.message)})${extra.length ? ` {${extra.join(', ')}}` : ''}`;
+      const extra = ((enc.props as Array<[string, EncodedValue]>) ?? []).map(([k, v]) => `${k}: ${describeEncoded(v, next)}`);
+      const body = `${enc.name}(${JSON.stringify(enc.message)})${extra.length ? ` {${extra.join(', ')}}` : ''}`;
+      const notes = truncationNotes(enc);
+      return notes.length ? `${body} (${notes.join(', ')})` : body;
     }
     case 'map': {
       const entries = ((enc.v as Array<[EncodedValue, EncodedValue]>) ?? []).map(([k, v]) => `${describeEncoded(k, next)} => ${describeEncoded(v, next)}`);

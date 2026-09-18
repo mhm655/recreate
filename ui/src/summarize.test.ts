@@ -37,6 +37,25 @@ describe('summarizeOutcome', () => {
     );
   });
 
+  it('notes truncation/dropped-key fields as dedicated markers, and still shows a real property of the same name', () => {
+    // These fields (truncatedLength/truncatedKeys/droppedSymbolKeys) used to be
+    // faked as ordinary [key, value] entries mixed into the real ones, making a
+    // real property of the same name indistinguishable from the marker. They are
+    // now dedicated fields on the node, so a real one just renders like any other.
+    expect(
+      summarizeOutcome({
+        type: 'return',
+        value: { t: 'array', i: 0, v: [{ t: 'num', v: 1 }], truncatedLength: 5, droppedSymbolKeys: 2 },
+      }),
+    ).toBe('returned [1] (showing first 1 of 5, 2 symbol key(s) dropped)');
+    expect(
+      summarizeOutcome({
+        type: 'return',
+        value: { t: 'object', i: 0, v: [['__truncatedKeys', { t: 'str', v: 'a real value' }]] },
+      }),
+    ).toBe('returned {__truncatedKeys: "a real value"}');
+  });
+
   it('formats a thrown outcome with class and message', () => {
     expect(summarizeOutcome({ type: 'thrown', errorClass: 'RangeError', message: 'out of range' })).toBe(
       'threw RangeError: out of range',
