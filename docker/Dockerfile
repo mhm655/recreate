@@ -6,7 +6,10 @@
 #   gVisor (runsc)    = the security boundary. Set at `docker run`, not here.
 #   this image        = keep the inside of that boundary small: no package manager,
 #                       no compiler, no node_modules, no writable app files, no root.
-#   worker thread     = interruptibility only (worker.terminate on timeout). NOT security.
+#   the sandbox itself = a single, wholly untrusted process. There is no privileged
+#                       component inside it holding a secret -- per-test timeouts and
+#                       memory limits are enforced by the HOST killing this whole
+#                       process/container from outside (src/host/supervise.ts).
 #
 # Build from the repository root:
 #   docker build -f docker/Dockerfile -t ts-sandbox-harness:latest .
@@ -44,10 +47,10 @@ RUN rm -rf /usr/local/lib/node_modules \
 
 WORKDIR /app
 
-# Only the modules that execute inside the sandbox. The harness depends on Node
-# built-ins and these four files; the host-side orchestrator, import guard and the
+# Only the modules that execute inside the sandbox. The sandbox depends on Node
+# built-ins and these files; the host-side orchestrator, import guard and the
 # TypeScript compiler are deliberately absent. Transpilation happens on the host.
-COPY --from=build /src/dist/src/sandbox/harness.js /src/dist/src/sandbox/worker.js ./dist/src/sandbox/
+COPY --from=build /src/dist/src/sandbox/harness.js ./dist/src/sandbox/
 COPY --from=build /src/dist/src/encoding.js /src/dist/src/channel.js /src/dist/src/protocol.js ./dist/src/
 
 # Owned by root, not writable by the sandbox user. The container also runs with

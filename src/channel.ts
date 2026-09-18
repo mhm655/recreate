@@ -1,58 +1,37 @@
 /**
- * Result channel framing.
+ * Result channel framing: plain NDJSON, one JSON value per line.
  *
- * Every line is `<hmac-sha256-hex> <json>\n`. The HMAC key is generated per run by
- * the host, handed to the harness parent thread over stdin, and never exposed to
- * the worker thread that runs untrusted code.
- *
- * What this buys and what it does not:
- *
- *   IT DOES stop a submitted function from fabricating passing results. The worker
- *   can write to fd 3 -- file descriptors are process-wide, so `fs.writeSync(3, ...)`
- *   from inside the sandbox reaches the host. Without signing, a function could
- *   simply print the answers it wished it had produced. Unsigned lines are counted
- *   and rejected.
- *
- *   IT DOES NOT make the channel a trust boundary. The key lives in the JS heap of
- *   a thread inside the same OS process as the untrusted code, and a thread can read
- *   its own process memory (`/proc/self/mem`). A sufficiently determined escape
- *   could recover the key. The real boundary is the gVisor container; this is
- *   integrity for the *report*, defending against the realistic threat (a submission
- *   that games its own grade), not against a kernel-level attacker.
- *
- * The stronger variant -- running untrusted code in a child *process* so the fd can
- * be withheld entirely -- is noted as future work in the README; this session's spec
- * calls for a worker thread, which shares the fd table by construction.
+ * Earlier versions of this signed every line with a per-pass HMAC key, because the
+ * sandbox held a privileged "harness" thread (trusted, held the key) and an
+ * unprivileged "worker" thread (ran the submission) sharing one OS process and one
+ * fd table -- the signature was how the host told which of the two had written a
+ * given line. That split is gone: the sandbox is now a single process with no
+ * privileged component inside it (see README.md's Security model section), so
+ * there is nothing left for a signature to distinguish. Every byte that arrives on
+ * this channel is the sandbox's own self-report, and the host is the only reader of
+ * the private pipe/stream it created for exactly this sandbox instance -- nothing
+ * else has a handle to write to it. What still needs defending against is not "who
+ * wrote this line" but "is this a genuine, complete result set", which
+ * src/host/orchestrator.ts's reconciliation (exact id set, no duplicates, no
+ * missing) still handles.
  */
 
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-
-export function newResultKey(): string {
-  return randomBytes(32).toString('hex');
-}
-
-function sign(key: string, payload: string): string {
-  return createHmac('sha256', Buffer.from(key, 'hex')).update(payload, 'utf8').digest('hex');
-}
-
-export function frame(key: string, value: unknown): string {
-  const json = JSON.stringify(value);
-  return `${sign(key, json)} ${json}\n`;
+export function frame(value: unknown): string {
+  return `${JSON.stringify(value)}\n`;
 }
 
 export interface ParsedChannel<T> {
-  /** Lines whose signature verified and whose JSON parsed. */
+  /** Lines whose JSON parsed successfully. */
   accepted: T[];
   /**
-   * Lines present on the channel that failed verification or parsing.
-   * `incomplete-line` is the benign case -- a container killed mid-write leaves a
-   * partial final line -- and is reported separately so it is not mistaken for
-   * tampering. `oversize` is also benign: it is checked only after the signature
-   * verifies, so it means a genuine, correctly-signed result that was simply too
-   * large to accept, not a forged or garbage line.
+   * Lines present on the channel that failed parsing. `incomplete-line` is the
+   * benign case -- a sandbox killed mid-write leaves a partial final line -- and is
+   * reported separately so it is not mistaken for a genuinely malformed line.
+   * `oversize` is also benign: a line that is valid JSON but simply too large to
+   * accept.
    */
   rejected: Array<{
-    reason: 'bad-signature' | 'bad-json' | 'malformed' | 'oversize' | 'incomplete-line';
+    reason: 'bad-json' | 'oversize' | 'incomplete-line';
     preview: string;
   }>;
   /** True if the raw payload exceeded the cap and was cut short. */
@@ -68,7 +47,6 @@ export interface ParsedChannel<T> {
  * orchestrator's reconciliation step.
  */
 export function parseChannel<T = unknown>(
-  key: string,
   raw: string,
   opts: { maxBytes: number; maxLineBytes?: number } = { maxBytes: 8 * 1024 * 1024 },
 ): ParsedChannel<T> {
@@ -80,7 +58,7 @@ export function parseChannel<T = unknown>(
   const rejected: ParsedChannel<T>['rejected'] = [];
 
   // A payload not ending in a newline means the writer was cut off mid-line (the
-  // container was killed). That final fragment is truncation, not tampering.
+  // sandbox was killed). That final fragment is truncation, not a malformed line.
   const lines = body.split('\n');
   const lastIsPartial = body.length > 0 && !body.endsWith('\n');
 
@@ -88,42 +66,19 @@ export function parseChannel<T = unknown>(
     const line = lines[li];
     const isFinalFragment = lastIsPartial && li === lines.length - 1;
     if (line.trim() === '') continue;
-    const reject = (reason: ParsedChannel<T>['rejected'][number]['reason']) => {
-      rejected.push({
-        reason: isFinalFragment ? 'incomplete-line' : reason,
-        preview: line.slice(0, 80),
-      });
-    };
 
-    const sep = line.indexOf(' ');
-    if (sep !== 64) {
-      reject('malformed');
+    if (isFinalFragment) {
+      rejected.push({ reason: 'incomplete-line', preview: line.slice(0, 80) });
       continue;
     }
-    const mac = line.slice(0, 64);
-    const json = line.slice(65);
-    if (!/^[0-9a-f]{64}$/.test(mac)) {
-      reject('malformed');
-      continue;
-    }
-    const expected = sign(key, json);
-    if (!timingSafeEqual(Buffer.from(mac, 'hex'), Buffer.from(expected, 'hex'))) {
-      reject('bad-signature');
-      continue;
-    }
-    // Checked AFTER authentication, on purpose: the encode budget (src/encoding.ts)
-    // can legitimately produce a multi-MB result, and the whole payload is already
-    // buffered in memory by this point, so verifying first costs nothing. That way
-    // 'oversize' always means "a genuine, signed line we won't accept," never a
-    // garbage/forged line that happens to be long -- those already failed above.
     if (Buffer.byteLength(line, 'utf8') > maxLineBytes) {
-      reject('oversize');
+      rejected.push({ reason: 'oversize', preview: line.slice(0, 80) });
       continue;
     }
     try {
-      accepted.push(JSON.parse(json) as T);
+      accepted.push(JSON.parse(line) as T);
     } catch {
-      reject('bad-json');
+      rejected.push({ reason: 'bad-json', preview: line.slice(0, 80) });
     }
   }
 

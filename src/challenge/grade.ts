@@ -85,7 +85,7 @@ export async function gradeAgainstChallenge(
   };
 }
 
-/** encodeArgs always encodes the whole argument list as one array node; this mirrors the same defensive unwrap the sandbox worker uses (src/sandbox/worker.ts) for consistency, though a Challenge's args should never fail to be an array. */
+/** encodeArgs always encodes the whole argument list as one array node; this mirrors the same defensive unwrap the sandbox uses (src/sandbox/harness.ts) for consistency, though a Challenge's args should never fail to be an array. */
 function toArgsArray(decoded: unknown): unknown[] {
   return Array.isArray(decoded) ? decoded : [decoded];
 }

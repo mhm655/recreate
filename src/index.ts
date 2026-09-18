@@ -2,7 +2,7 @@
 export * from './encoding';
 export * from './protocol';
 export * from './import-guard';
-export { newResultKey, frame, parseChannel } from './channel';
+export { frame, parseChannel } from './channel';
 export { transpileSubmission } from './transpile';
 export { bundleSubmission, VENDORED_MODULES } from './bundle';
 export { evaluate, reconcile, shuffle, summarizeOutcome } from './host/orchestrator';

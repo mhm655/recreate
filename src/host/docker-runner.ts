@@ -1,23 +1,24 @@
 /**
- * The real runner: one container per pass, gVisor as the security boundary.
+ * The real runner: one container per pass (and per retry within a pass -- see
+ * src/host/supervise.ts), gVisor as the security boundary.
  *
  * Channel layout inside the container:
  *
  *   fd 0  request payload (trusted, written by us)
- *   fd 1  RESULT CHANNEL  -- written only by the harness parent thread, HMAC signed
+ *   fd 1  RESULT CHANNEL  -- plain unsigned NDJSON; see src/channel.ts and the
+ *         Security model section of README.md for why no signature is needed
  *   fd 2  console output from untrusted code, plus runtime diagnostics
  *
  * Results ride fd 1 here rather than fd 3 because `docker run` forwards exactly
  * three descriptors into a container; there is no way to hand it a fourth. The
  * property the design actually needs is that results and untrusted console output
- * never share a descriptor, and that holds: `SANDBOX_RESULT_FD=1` tells the harness
- * to put results on fd 1 and route all worker stdio to fd 2. Channel integrity does
- * not rest on the fd number in any case -- it rests on the per-run HMAC and on the
- * host reconciling the returned test-id set.
+ * never share a descriptor, and that holds: `SANDBOX_RESULT_FD=1` tells the sandbox
+ * to put results on fd 1 and route all its own stdio to fd 2.
  *
- * Each pass gets its own container. Fresh container means fresh tmpfs, fresh
- * process, fresh everything, so state cannot leak from the ordered pass into the
- * shuffled one by any route -- not module scope, not the filesystem.
+ * Every pass attempt gets its own fresh container. Fresh container means fresh
+ * tmpfs, fresh process, fresh everything, so state cannot leak from the ordered
+ * pass into the shuffled one by any route -- not module scope, not the filesystem
+ * -- and a retry after a hang/OOM starts equally clean.
  */
 
 import { spawn } from 'node:child_process';
@@ -25,6 +26,7 @@ import { randomUUID } from 'node:crypto';
 import * as path from 'node:path';
 
 import type { SandboxRequest } from '../protocol';
+import { supervisePass, type Attempt, type AttemptExit, type SpawnedAttempt } from './supervise';
 import type { RunnerResult, SandboxRunner } from './runner';
 
 export interface DockerRunnerOptions {
@@ -123,8 +125,10 @@ export class DockerRunner implements SandboxRunner {
   /**
    * The full `docker run` argument list. `entrypoint` is only for verifyIsolation(),
    * which needs to run probes under exactly the flags real submissions get.
+   * `maxOldSpaceMb` is unset for verifyIsolation's probe, which doesn't run a
+   * submission and so has no request-specific limits to apply.
    */
-  private buildArgs(containerName: string, entrypoint?: { command: string; args: string[] }): string[] {
+  private buildArgs(containerName: string, entrypoint?: { command: string; args: string[] }, maxOldSpaceMb?: number): string[] {
     const o = this.opts;
     const args = [
       'run',
@@ -143,9 +147,10 @@ export class DockerRunner implements SandboxRunner {
       // slow slide into swap thrash.
       '--memory-swap', `${o.memoryMb}m`,
       '--cpus', String(o.cpus),
-      // Caps total tasks in the cgroup, which is what stops a fork bomb. Threads
-      // count towards this, and Node uses a handful (libuv pool, V8 helpers) plus
-      // our worker, so this cannot be set as low as intuition suggests.
+      // Caps total tasks in the cgroup, which is what stops a fork bomb. Only one
+      // process/thread runs in here now (see README.md's Security model section),
+      // but Node still uses a handful of internal threads (libuv pool, V8 helpers),
+      // so this cannot be set as low as intuition suggests.
       '--pids-limit', String(o.pidsLimit),
       '--user', o.user,
       '--cap-drop', 'ALL',
@@ -163,6 +168,14 @@ export class DockerRunner implements SandboxRunner {
       '--env', 'NODE_ENV=production',
       '--workdir', '/app',
     ];
+
+    // The V8 heap cap is per-request (Limits.workerMaxOldGenerationMb), so it can't
+    // be baked into the image's static ENTRYPOINT the way --disallow-code-generation-
+    // from-strings is; NODE_OPTIONS is Node's own supported way to add V8 flags at
+    // startup without changing argv.
+    if (maxOldSpaceMb !== undefined) {
+      args.push('--env', `NODE_OPTIONS=--max-old-space-size=${maxOldSpaceMb}`);
+    }
 
     if (this.opts.seccompProfile === 'unconfined') {
       args.push('--security-opt', 'seccomp=unconfined');
@@ -202,79 +215,92 @@ export class DockerRunner implements SandboxRunner {
     }
   }
 
-  async run(request: SandboxRequest, timeoutMs: number): Promise<RunnerResult> {
-    const started = Date.now();
-    const containerName = `tsbox-${request.runId.slice(0, 8)}-${request.passId}-${randomUUID().slice(0, 8)}`;
-    const args = this.buildArgs(containerName);
+  run(request: SandboxRequest, timeoutMs: number): Promise<RunnerResult> {
+    return supervisePass({
+      tests: request.tests,
+      limits: request.limits,
+      hostTimeoutMs: timeoutMs,
+      // Matches STARTUP_GRACE_MS.isolated in host/orchestrator.ts: gVisor + a fresh
+      // container's cold start is a real, variable cost that isn't the submission's
+      // fault.
+      startupGraceMs: 30_000,
+      passId: request.passId,
+      spawnAttempt: (tests, generation) => this.spawnOne(request, tests, generation),
+    });
+  }
 
-    let resultChannel = '';
-    let rawOutput = '';
-    let hostTimedOut = false;
+  /** One container: one attempt at (a subset of) one pass. See src/host/supervise.ts. */
+  private spawnOne(request: SandboxRequest, tests: SandboxRequest['tests'], generation: number): SpawnedAttempt {
+    const attemptRequest: SandboxRequest = { ...request, tests, generation };
+    const containerName = `tsbox-${request.runId.slice(0, 8)}-${request.passId}-g${generation}-${randomUUID().slice(0, 8)}`;
+    const args = this.buildArgs(containerName, undefined, request.limits.workerMaxOldGenerationMb);
+    const cap = request.limits.maxResultBytes;
 
-    const outcome = await new Promise<{ code: number | null; signal: string | null; startupError?: string }>(
-      (resolve) => {
-        const child = spawn(this.opts.dockerPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
-        let settled = false;
-        const cap = request.limits.maxResultBytes;
-        const rawCap = request.limits.maxRawOutputBytes;
+    const child = spawn(this.opts.dockerPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const resultCallbacks: Array<(chunk: string) => void> = [];
+    const rawCallbacks: Array<(chunk: string) => void> = [];
+    let resultBytes = 0;
 
-        child.stdout.on('data', (chunk: Buffer) => {
-          if (resultChannel.length < cap) resultChannel += chunk.toString('utf8');
-        });
-        child.stderr.on('data', (chunk: Buffer) => {
-          if (rawOutput.length < rawCap) rawOutput += chunk.toString('utf8');
-        });
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (resultBytes >= cap) return;
+      resultBytes += chunk.byteLength;
+      const text = chunk.toString('utf8');
+      for (const cb of resultCallbacks) cb(text);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8');
+      for (const cb of rawCallbacks) cb(text);
+    });
 
-        const timer = setTimeout(() => {
-          hostTimedOut = true;
-          // SIGKILL the container itself, not just the docker client: killing the
-          // client would leave the workload running.
-          void exec(this.opts.dockerPath, ['kill', '--signal', 'KILL', containerName], 20_000);
-        }, timeoutMs);
+    const closed = new Promise<{ code: number | null; signal: string | null; startupError?: string }>((resolve) => {
+      let settled = false;
+      const finish = (code: number | null, signal: string | null, startupError?: string) => {
+        if (settled) return;
+        settled = true;
+        resolve({ code, signal, startupError });
+      };
+      child.on('error', (err) => finish(null, null, `failed to spawn docker: ${err.message}`));
+      child.on('close', (code, signal) => finish(code, signal));
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(JSON.stringify(attemptRequest));
 
-        const finish = (code: number | null, signal: string | null, startupError?: string) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve({ code, signal, startupError });
-        };
-
-        child.on('error', (err) => finish(null, null, `failed to spawn docker: ${err.message}`));
-        child.on('close', (code, signal) => finish(code, signal));
-        child.stdin.on('error', () => {});
-        child.stdin.end(JSON.stringify(request));
-      },
-    );
-
-    let oomKilled = false;
-    let exitCode = outcome.code;
-    try {
-      const inspect = await exec(
-        this.opts.dockerPath,
-        ['inspect', '--format', '{{.State.OOMKilled}}|{{.State.ExitCode}}', containerName],
-        15_000,
-      );
-      if (inspect.code === 0) {
-        const [oom, code] = inspect.stdout.trim().split('|');
-        oomKilled = oom === 'true';
-        const parsed = Number(code);
-        if (Number.isFinite(parsed)) exitCode = parsed;
+    const exited: Promise<AttemptExit> = closed.then(async (outcome) => {
+      let oomKilled = false;
+      let exitCode = outcome.code;
+      try {
+        const inspect = await exec(
+          this.opts.dockerPath,
+          ['inspect', '--format', '{{.State.OOMKilled}}|{{.State.ExitCode}}', containerName],
+          15_000,
+        );
+        if (inspect.code === 0) {
+          const [oom, code] = inspect.stdout.trim().split('|');
+          oomKilled = oom === 'true';
+          const parsed = Number(code);
+          if (Number.isFinite(parsed)) exitCode = parsed;
+        }
+      } catch {
+        /* inspection is best-effort; the run is already over */
+      } finally {
+        await exec(this.opts.dockerPath, ['rm', '--force', containerName], 20_000).catch(() => undefined);
       }
-    } catch {
-      /* inspection is best-effort; the run is already over */
-    } finally {
-      await exec(this.opts.dockerPath, ['rm', '--force', containerName], 20_000).catch(() => undefined);
-    }
+      return { exitCode, signal: outcome.signal, oomKilled, startupError: outcome.startupError };
+    });
+
+    const attempt: Attempt = {
+      exited,
+      // SIGKILL the container itself, not just the docker client: killing the
+      // client would leave the workload running.
+      kill: () => {
+        void exec(this.opts.dockerPath, ['kill', '--signal', 'KILL', containerName], 20_000);
+      },
+    };
 
     return {
-      resultChannel,
-      rawOutput,
-      exitCode,
-      signal: outcome.signal,
-      hostTimedOut,
-      oomKilled,
-      startupError: outcome.startupError,
-      wallMs: Date.now() - started,
+      attempt,
+      onResultData: (cb) => resultCallbacks.push(cb),
+      onRawData: (cb) => rawCallbacks.push(cb),
     };
   }
 }
@@ -311,7 +337,7 @@ try {
   rec('kernel is gVisor', /gvisor/i.test(v), v.trim());
 } catch (e) { rec('kernel is gVisor', false, code(e)); }
 
-let pending = 2;
+let pending = 1;
 const done = () => { if (--pending === 0) { console.log(JSON.stringify(results)); process.exit(0); } };
 
 try {
@@ -320,14 +346,6 @@ try {
   sock.on('connect', () => { clearTimeout(t); rec('no network egress', false, 'connected to 1.1.1.1:80'); sock.destroy(); done(); });
   sock.on('error', (e) => { clearTimeout(t); rec('no network egress', true, code(e)); done(); });
 } catch (e) { rec('no network egress', true, code(e)); done(); }
-
-try {
-  const { Worker } = require('worker_threads');
-  const w = new Worker('require("worker_threads").parentPort.postMessage("up")', { eval: true });
-  const t = setTimeout(() => { rec('worker threads still work (harness needs them)', false, 'no message'); done(); }, 5000);
-  w.on('message', () => { clearTimeout(t); rec('worker threads still work (harness needs them)', true, 'ok'); w.terminate(); done(); });
-  w.on('error', (e) => { clearTimeout(t); rec('worker threads still work (harness needs them)', false, code(e)); done(); });
-} catch (e) { rec('worker threads still work (harness needs them)', false, code(e)); done(); }
 `;
 
 function exec(

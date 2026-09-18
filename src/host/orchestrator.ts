@@ -3,7 +3,6 @@
  *
  * Everything that comes back from a sandbox is treated as attacker-influenced:
  *
- *   - lines are HMAC verified before being parsed at all;
  *   - parsing is plain `JSON.parse` under a byte cap, nothing more capable;
  *   - the returned test-id multiset must match the expected one exactly. Not a
  *     subset, not a superset, no duplicates. A submission that returns results for
@@ -34,7 +33,6 @@ import {
   type TestInput,
   type TestResult,
 } from '../protocol';
-import { newResultKey } from '../channel';
 import { transpileSubmission } from '../transpile';
 import { bundleSubmission, VENDORED_MODULES } from '../bundle';
 import type { RunnerResult, SandboxRunner } from './runner';
@@ -77,7 +75,7 @@ export interface PassReport {
   order: string[];
   results: TestResult[];
   problems: Problem[];
-  /** Number of worker instances used. >1 means a worker was killed mid-pass. */
+  /** Number of sandbox attempts used. >1 means an earlier attempt was killed mid-pass (hang or resource limit) and a fresh one took over. */
   workerGenerations: number;
   consoleOutput: string;
   exitCode: number | null;
@@ -323,22 +321,21 @@ async function runPass(args: {
   runner: SandboxRunner;
   hostTimeoutMs: number;
 }): Promise<PassReport> {
-  // A fresh key per pass: a key recovered from one container is useless against the
-  // other, so forged results cannot be replayed between passes.
-  const resultKey = newResultKey();
   const request: SandboxRequest = {
     protocolVersion: PROTOCOL_VERSION,
     runId: args.runId,
     passId: args.passId,
-    resultKey,
     entryName: args.entryName,
     code: args.code,
     tests: args.tests,
+    // Overwritten per attempt by the runner (src/host/supervise.ts) if a retry is
+    // needed mid-pass; 1 here is only what a clean, single-attempt pass reports.
+    generation: 1,
     limits: args.limits,
   };
 
   const raw = await args.runner.run(request, args.hostTimeoutMs);
-  return reconcile(args.passId, args.tests.map((t) => t.id), resultKey, raw, args.limits);
+  return reconcile(args.passId, args.tests.map((t) => t.id), raw, args.limits);
 }
 
 /**
@@ -350,37 +347,33 @@ async function runPass(args: {
 export function reconcile(
   passId: string,
   expectedIds: string[],
-  resultKey: string,
   raw: RunnerResult,
   limits: Limits,
 ): PassReport {
   const problems: Problem[] = [];
-  const parsed = parseChannel<ResultLine>(resultKey, raw.resultChannel, {
+  const parsed = parseChannel<ResultLine>(raw.resultChannel, {
     maxBytes: limits.maxResultBytes,
   });
 
-  // 'oversize' is deliberately excluded: src/channel.ts only applies that check
-  // after a line's signature verifies, so it means a genuine, correctly-signed
-  // result that was too large to accept -- not tampering.
-  const forged = parsed.rejected.filter(
-    (r) => r.reason === 'bad-signature' || r.reason === 'malformed' || r.reason === 'bad-json',
-  );
+  // A bad-json line is a genuine anomaly (the sandbox is the only writer to this
+  // channel, and it writes JSON.stringify'd lines -- see channel.ts), but it isn't
+  // "tampering" in the old signed-channel sense: there is no longer a distinction
+  // inside the sandbox between a trusted writer and an untrusted one to forge.
+  const malformed = parsed.rejected.filter((r) => r.reason === 'bad-json');
   const oversized = parsed.rejected.filter((r) => r.reason === 'oversize');
   const truncatedLines = parsed.rejected.filter((r) => r.reason === 'incomplete-line');
 
-  if (forged.length) {
+  if (malformed.length) {
     problems.push({
-      code: 'unsigned_channel_lines',
-      detail:
-        `${forged.length} line(s) on the result channel failed verification ` +
-        `(first: ${forged[0].reason} "${forged[0].preview}"). Untrusted code wrote to the result fd.`,
+      code: 'malformed_channel_lines',
+      detail: `${malformed.length} line(s) on the result channel were not valid JSON (first: "${malformed[0].preview}").`,
     });
   }
   if (oversized.length) {
     problems.push({
       code: 'result_line_too_large',
       detail:
-        `${oversized.length} signed result(s) exceeded the per-line size limit and were not accepted ` +
+        `${oversized.length} result(s) exceeded the per-line size limit and were not accepted ` +
         `(first: "${oversized[0].preview}..."). Not tampering -- the encoded result was simply too large; ` +
         'the affected test(s) will show up as missing.',
     });
@@ -451,7 +444,7 @@ export function reconcile(
   let status: PassStatus;
   if (raw.startupError) {
     status = 'sandbox_error';
-  } else if (forged.length || duplicates.length || extras.length || unexpectedShapes.length) {
+  } else if (malformed.length || duplicates.length || extras.length || unexpectedShapes.length) {
     status = 'integrity_violation';
   } else if (raw.oomKilled || raw.hostTimedOut || raw.signal === 'SIGKILL' || raw.exitCode === 137) {
     status = 'resource_limit_exceeded';
@@ -474,7 +467,11 @@ export function reconcile(
     order: expectedIds,
     results,
     problems,
-    workerGenerations: passEnd?.workerGenerations ?? 0,
+    // No longer reported by the sandbox itself (there's no in-sandbox concept of
+    // "generation" now that per-test retries happen on the host -- see
+    // src/host/supervise.ts). Each TestResult already carries which attempt
+    // produced it, so the max across them is exactly the same count.
+    workerGenerations: results.reduce((max, r) => Math.max(max, r.workerGeneration), 0),
     consoleOutput: raw.rawOutput,
     exitCode: raw.exitCode,
     signal: raw.signal,

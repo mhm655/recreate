@@ -17,7 +17,7 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import * as path from 'node:path';
 
-import { decode, encodeArgs, frame, newResultKey, parseChannel, recordCalls, type EncodedValue } from '../src/index';
+import { decode, encodeArgs, frame, parseChannel, recordCalls, type EncodedValue } from '../src/index';
 import { DockerRunner } from '../src/host/docker-runner';
 import { evaluate, reconcile, type SubmissionReport, type TestCase } from '../src/host/orchestrator';
 import { LocalRunner, type RunnerResult, type SandboxRunner } from '../src/host/runner';
@@ -122,7 +122,7 @@ describe('hostile: memory bombs', () => {
     assert.equal(report.verdict, 'ok', explain(report));
   });
 
-  it('off-heap growth that the V8 heap cap cannot see is caught by the RSS watchdog', async () => {
+  it('off-heap growth that a heartbeat can catch mid-loop is caught by the RSS watchdog', async () => {
     const report = await run(H.OFF_HEAP_BOMB, [
       { id: 'bomb', args: [true] },
       { id: 'after-bomb', args: [false] },
@@ -131,31 +131,45 @@ describe('hostile: memory bombs', () => {
       assert.equal(pass.status, 'ok', explain(report));
       const results = byId(pass.results);
       const bomb = results.get('bomb')!.outcome;
-      assert.equal(bomb.type, 'resource_limit', JSON.stringify(bomb));
-      assert.equal((bomb as { limit: string }).limit, 'memory');
+      // Regression note: this fixture's loop is fully synchronous (no `await`/yield
+      // point), so it never actually gives the host's heartbeat mechanism a chance to
+      // see it coming -- see the next test for what that means honestly. This test
+      // still passed under the OLD worker-thread design (a live sibling thread could
+      // poll RSS regardless of whether the busy loop itself ever yielded), so its
+      // outcome type changed from resource_limit/memory to timeout; kept here as a
+      // deliberate marker of that precision loss, not a bug.
+      assert.equal(bomb.type, 'timeout', JSON.stringify(bomb));
       assert.equal(returned(results.get('after-bomb')), 'fine');
     }
-    // Regression: the watchdog's detail includes a run-specific RSS figure. Two passes
-    // that both hit the cap must still count as agreeing.
     assert.equal(report.verdict, 'ok', explain(report));
   });
 
-  it('off-heap growth at module scope, before any test runs, is also caught by the watchdog', async () => {
-    // Every worker spawn re-runs this module-level loop during compile(), so every
-    // test in the pass independently hits the cap and gets a fresh worker after.
-    const report = await run(H.OFF_HEAP_BOMB_AT_MODULE_SCOPE, [
-      { id: 'a', args: [] },
-      { id: 'b', args: [] },
-    ]);
-    for (const pass of report.passes) {
-      assert.equal(pass.status, 'ok', explain(report));
-      for (const r of pass.results) {
-        assert.equal(r.outcome.type, 'resource_limit', JSON.stringify(r.outcome));
-        assert.equal((r.outcome as { limit: string }).limit, 'memory');
+  it(
+    'a fully synchronous off-heap bomb is caught as a timeout, not attributed to memory, under LocalRunner',
+    async () => {
+      // Honest limitation, not a bug: with no privileged thread left alive inside
+      // the sandbox to poll its own RSS (see README.md's Security model section),
+      // the host can only detect memory growth via the sandbox's own heartbeat
+      // self-reports, OR (for DockerRunner only) by inspecting the container's
+      // OOMKilled flag after the fact. A loop with no `await`/yield point ever
+      // returns to the event loop, so it never sends a heartbeat either -- from the
+      // host's side this is indistinguishable from any other hang, and LocalRunner
+      // has no cgroup to inspect after killing it. DockerRunner gets the precise
+      // attribution back (see 'container-level limits' below); this documents the
+      // honest, safe-but-less-precise fallback for the unsandboxed dev runner.
+      const report = await run(H.OFF_HEAP_BOMB_AT_MODULE_SCOPE, [
+        { id: 'a', args: [] },
+        { id: 'b', args: [] },
+      ]);
+      for (const pass of report.passes) {
+        assert.equal(pass.status, 'ok', explain(report));
+        for (const r of pass.results) {
+          assert.equal(r.outcome.type, 'timeout', JSON.stringify(r.outcome));
+        }
       }
-    }
-    assert.equal(report.verdict, 'ok', explain(report));
-  });
+      assert.equal(report.verdict, 'ok', explain(report));
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -437,15 +451,9 @@ describe('hostile: writes straight to the result fd', { skip: USE_DOCKER && 'tam
 
   it('rejects garbage lines interleaved with genuine results', async () => {
     const report = await tamper('garbage');
-    expectFailure(report, 'integrity_violation', 'unsigned_channel_lines');
+    expectFailure(report, 'integrity_violation', 'malformed_channel_lines');
     // The genuine results still arrived alongside the junk; it is the junk that fails the run.
     for (const pass of report.passes) assert.equal(pass.results.length, 2, explain(report));
-  });
-
-  it('rejects a well-formed but unsigned forged result', async () => {
-    const report = await tamper('forge-unsigned');
-    expectFailure(report, 'integrity_violation', 'unsigned_channel_lines');
-    assert.equal(JSON.stringify(report).includes('the answer the attacker wanted'), false);
   });
 
   it('rejects a result set with an entry missing', async () => {
@@ -460,19 +468,21 @@ describe('hostile: writes straight to the result fd', { skip: USE_DOCKER && 'tam
     }
   });
 
-  it('rejects duplicated (replayed) correctly-signed entries', async () => {
+  it('rejects duplicated (replayed) entries', async () => {
     const report = await tamper('duplicate');
     expectFailure(report, 'integrity_violation', 'duplicate_results');
     for (const pass of report.passes) assert.equal(pass.results.length, 2, explain(report));
   });
 
-  it('rejects an extra entry even when the attacker holds the signing key', async () => {
-    const report = await tamper('extra-signed');
+  it('rejects a well-formed extra entry for a test that was never asked for', async () => {
+    // There is no signing key any more to make this "the worst case" -- every line
+    // on this channel is equally well-formed and equally untrusted (see the
+    // Security model section of README.md). Id-set reconciliation is the only thing
+    // that was ever going to catch this, signing or not.
+    const report = await tamper('extra');
     expectFailure(report, 'integrity_violation', 'unexpected_results');
     for (const pass of report.passes) {
       assert.ok(pass.problems.some((p) => p.detail.includes('phantom-test')), explain(report));
-      // The forged line verified: signing alone would not have caught this.
-      assert.equal(pass.problems.some((p) => p.code === 'unsigned_channel_lines'), false, explain(report));
     }
   });
 });
@@ -690,87 +700,62 @@ describe('reconciliation edge cases (synthetic channel data)', () => {
   const ok = (resultChannel: string, over: Partial<RunnerResult> = {}): RunnerResult => ({
     resultChannel, rawOutput: '', exitCode: 0, signal: null, hostTimedOut: false, oomKilled: false, wallMs: 1, ...over,
   });
-  const line = (key: string, testId: string) =>
-    frame(key, {
+  const line = (testId: string) =>
+    frame({
       kind: 'result',
       result: {
         testId, outcome: { type: 'return', value: { t: 'num', v: 1 } }, argsAfterCall: { t: 'array', i: 0, v: [] },
         consoleOutput: '', durationMs: 0, workerGeneration: 1,
       },
     });
-  const end = (key: string) => frame(key, { kind: 'pass-end', passId: 'a', workerGenerations: 1, completed: 2 });
+  const end = () => frame({ kind: 'pass-end', passId: 'a', completed: 2 });
 
   it('accepts exactly the expected set', () => {
-    const key = newResultKey();
-    const pass = reconcile('a', ['t1', 't2'], key, ok(line(key, 't1') + line(key, 't2') + end(key)), limits);
+    const pass = reconcile('a', ['t1', 't2'], ok(line('t1') + line('t2') + end()), limits);
     assert.equal(pass.status, 'ok');
   });
 
-  it('a line signed for one pass is rejected by the other pass', () => {
-    const keyA = newResultKey();
-    const keyB = newResultKey();
-    const parsed = parseChannel(keyB, line(keyA, 't1'), { maxBytes: 1_000_000 });
-    assert.equal(parsed.accepted.length, 0);
-    assert.equal(parsed.rejected[0].reason, 'bad-signature');
-  });
-
   it('a container OOM kill is resource_limit_exceeded, not a crash or a partial pass', () => {
-    const key = newResultKey();
-    const pass = reconcile('a', ['t1', 't2'], key, ok(line(key, 't1'), { exitCode: 137, oomKilled: true }), limits);
+    const pass = reconcile('a', ['t1', 't2'], ok(line('t1'), { exitCode: 137, oomKilled: true }), limits);
     assert.equal(pass.status, 'resource_limit_exceeded');
     assert.ok(pass.problems.some((p) => p.code === 'container_oom'));
     assert.ok(pass.problems.some((p) => p.code === 'missing_results'));
   });
 
   it('a SIGKILL without OOM attribution (pids, host timeout) is still resource_limit_exceeded', () => {
-    const key = newResultKey();
-    const pass = reconcile('a', ['t1'], key, ok('', { exitCode: null, signal: 'SIGKILL' }), limits);
+    const pass = reconcile('a', ['t1'], ok('', { exitCode: null, signal: 'SIGKILL' }), limits);
     assert.equal(pass.status, 'resource_limit_exceeded');
   });
 
-  it('a final line cut off mid-write is truncation, not tampering', () => {
-    const key = newResultKey();
-    const partial = line(key, 't2').slice(0, 90);
-    const pass = reconcile('a', ['t1', 't2'], key, ok(line(key, 't1') + partial, { exitCode: 137 }), limits);
+  it('a final line cut off mid-write is truncation, not a malformed line', () => {
+    const partial = line('t2').slice(0, 20);
+    const pass = reconcile('a', ['t1', 't2'], ok(line('t1') + partial, { exitCode: 137 }), limits);
     assert.equal(pass.status, 'resource_limit_exceeded');
-    assert.equal(pass.problems.some((p) => p.code === 'unsigned_channel_lines'), false);
+    assert.equal(pass.problems.some((p) => p.code === 'malformed_channel_lines'), false);
     assert.ok(pass.problems.some((p) => p.code === 'result_channel_cut_short'));
   });
 
   it('a payload over the byte cap fails the pass', () => {
-    const key = newResultKey();
-    const channel = line(key, 't1') + end(key);
-    const pass = reconcile('a', ['t1'], key, ok(channel), { ...limits, maxResultBytes: 100 });
+    const channel = line('t1') + end();
+    const pass = reconcile('a', ['t1'], ok(channel), { ...limits, maxResultBytes: 100 });
     assert.notEqual(pass.status, 'ok');
     assert.ok(pass.problems.some((p) => p.code === 'result_channel_truncated'));
   });
 
   it('a clean exit that never reports pass-end is incomplete', () => {
-    const key = newResultKey();
-    const pass = reconcile('a', ['t1'], key, ok(line(key, 't1')), limits);
+    const pass = reconcile('a', ['t1'], ok(line('t1')), limits);
     assert.equal(pass.status, 'incomplete');
   });
 
-  it('an oversize line is checked only after its signature verifies, so it is never mistaken for tampering', () => {
-    // Regression: 'oversize' used to be checked BEFORE signature verification, so a
-    // garbage/forged huge line and a genuine, correctly-signed-but-too-large result
-    // were indistinguishable -- both landed in the same 'forged' bucket.
-    const key = newResultKey();
-    const wrongKey = newResultKey();
+  it('an oversize line is still recognisable, never mistaken for a malformed one', () => {
     const tinyBudget = { maxBytes: 1_000_000, maxLineBytes: 10 };
-
-    const genuine = parseChannel(key, line(key, 't1'), tinyBudget);
-    assert.equal(genuine.accepted.length, 0);
-    assert.equal(genuine.rejected[0].reason, 'oversize');
-
-    const forged = parseChannel(wrongKey, line(key, 't1'), tinyBudget);
-    assert.equal(forged.accepted.length, 0);
-    assert.equal(forged.rejected[0].reason, 'bad-signature', 'a wrong-key line must fail on signature, not size');
+    const parsed = parseChannel(line('t1'), tinyBudget);
+    assert.equal(parsed.accepted.length, 0);
+    assert.equal(parsed.rejected[0].reason, 'oversize');
   });
 
-  it('a genuine oversized result is reported as missing, not as tampering', () => {
-    const key = newResultKey();
-    const hugeResult = frame(key, {
+  it('a genuine oversized result is reported as missing, not as a malformed line', () => {
+    const hugeResult = frame({
       kind: 'result',
       result: {
         testId: 't2',
@@ -781,11 +766,11 @@ describe('reconciliation edge cases (synthetic channel data)', () => {
         workerGeneration: 1,
       },
     });
-    const pass = reconcile('a', ['t1', 't2'], key, ok(line(key, 't1') + hugeResult + end(key)), limits);
+    const pass = reconcile('a', ['t1', 't2'], ok(line('t1') + hugeResult + end()), limits);
     assert.equal(pass.status, 'incomplete', JSON.stringify(pass.problems));
     assert.ok(pass.problems.some((p) => p.code === 'result_line_too_large'), JSON.stringify(pass.problems));
     assert.ok(pass.problems.some((p) => p.code === 'missing_results'), JSON.stringify(pass.problems));
-    assert.equal(pass.problems.some((p) => p.code === 'unsigned_channel_lines'), false, JSON.stringify(pass.problems));
+    assert.equal(pass.problems.some((p) => p.code === 'malformed_channel_lines'), false, JSON.stringify(pass.problems));
   });
 });
 
@@ -794,13 +779,12 @@ describe('reconciliation edge cases (synthetic channel data)', () => {
 describe('hostile: host-side kill', { skip: USE_DOCKER && 'uses LocalRunner timing directly' }, () => {
   it('a sandbox that outlives the host budget is killed and reported as resource_limit_exceeded', async () => {
     const limits: Limits = { ...DEFAULT_LIMITS, perTestTimeoutMs: 60_000, passTimeoutMs: 60_000 };
-    const key = newResultKey();
-    const request = buildRequest(H.BUSY_LOOP, 'spin', [[true]], limits, key);
+    const request = buildRequest(H.BUSY_LOOP, 'spin', [[true]], limits);
     const started = Date.now();
     const raw = await new LocalRunner().run(request, 1_500);
     assert.ok(Date.now() - started < 10_000, 'host kill did not happen promptly');
     assert.equal(raw.hostTimedOut, true);
-    const pass = reconcile('a', ['t1'], key, raw, limits);
+    const pass = reconcile('a', ['t1'], raw, limits);
     assert.equal(pass.status, 'resource_limit_exceeded');
     assert.ok(pass.problems.some((p) => p.code === 'host_timeout'));
   });
@@ -812,7 +796,16 @@ describe('container-level limits', { skip: !USE_DOCKER && 'set TSBOX_TEST_RUNNER
   let docker: DockerRunner;
   after(() => undefined);
 
-  it('an allocation that outruns every in-sandbox cap is OOM-killed by the container and reported cleanly', async () => {
+  it('an allocation that outruns every in-sandbox cap is OOM-killed by the container and reported cleanly, not failing the whole pass', async () => {
+    // Regression note: under the OLD one-container-per-pass design, a hard cgroup
+    // kill always took the pass down with no chance to recover (there was nothing
+    // left to run the remaining tests), so this used to assert
+    // resource_limit_exceeded at the pass level. Under the new design, DockerRunner
+    // (src/host/docker-runner.ts) inspects the dead container's OOMKilled flag,
+    // attributes a clean resource_limit/memory outcome to the specific test that
+    // was running, and starts a fresh container for whatever's left -- exactly like
+    // an early RSS-watchdog catch, just via a different signal. With only one test
+    // here, there's nothing left to run afterwards, and the pass is coherently 'ok'.
     docker = new DockerRunner({ memoryMb: 128 });
     const report = await evaluate({
       source: H.OFF_HEAP_BOMB,
@@ -821,24 +814,29 @@ describe('container-level limits', { skip: !USE_DOCKER && 'set TSBOX_TEST_RUNNER
       // Watchdog disabled (cap far above the container limit) so the cgroup is what trips.
       limits: { ...LIMITS, maxProcessRssMb: 64_000 },
     });
-    assert.equal(report.verdict, 'failed', explain(report));
-    for (const pass of report.passes) assert.equal(pass.status, 'resource_limit_exceeded', explain(report));
+    assert.equal(report.verdict, 'ok', explain(report));
+    for (const pass of report.passes) {
+      assert.equal(pass.status, 'ok', explain(report));
+      const bomb = pass.results.find((r) => r.testId === 'bomb')!.outcome;
+      assert.equal(bomb.type, 'resource_limit', JSON.stringify(bomb));
+      assert.equal((bomb as { limit: string }).limit, 'memory');
+    }
   });
 });
 
 // --- helpers ---------------------------------------------------------------
 
-function buildRequest(source: string, entryName: string, argLists: unknown[][], limits: Limits, key: string): SandboxRequest {
+function buildRequest(source: string, entryName: string, argLists: unknown[][], limits: Limits): SandboxRequest {
   const t = transpileSubmission(source);
   if (!t.ok) throw new Error(t.detail);
   return {
     protocolVersion: PROTOCOL_VERSION,
     runId: 'direct',
     passId: 'a',
-    resultKey: key,
     entryName,
     code: t.code,
     tests: argLists.map((args, i) => ({ id: `t${i + 1}`, args: encodeArgs(args) })),
+    generation: 1,
     limits,
   };
 }
@@ -846,10 +844,9 @@ function buildRequest(source: string, entryName: string, argLists: unknown[][], 
 /** Run one pass with static analysis deliberately bypassed, to test the runtime layers alone. */
 async function runDirect(source: string, entryName: string, argLists: unknown[][]): Promise<TestResult[]> {
   const limits: Limits = { ...DEFAULT_LIMITS, ...LIMITS } as Limits;
-  const key = newResultKey();
-  const request = buildRequest(source, entryName, argLists, limits, key);
+  const request = buildRequest(source, entryName, argLists, limits);
   const raw = await runner.run(request, 60_000);
-  const pass = reconcile('a', request.tests.map((t) => t.id), key, raw, limits);
+  const pass = reconcile('a', request.tests.map((t) => t.id), raw, limits);
   assert.equal(pass.status, 'ok', JSON.stringify(pass.problems));
   return pass.results;
 }

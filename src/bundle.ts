@@ -2,7 +2,7 @@
  * Inlines vetted dependencies into a submission, on the HOST, after transpilation.
  *
  * The sandbox image ships no `node_modules` (see docker/Dockerfile) and the worker's
- * `require` throws unconditionally (see src/sandbox/worker.ts) -- both on purpose, to
+ * `require` throws unconditionally (see src/sandbox/harness.ts) -- both on purpose, to
  * keep the code inside the isolation boundary to a minimum. Supporting a dependency
  * like `lodash-es` without touching either of those means resolving and inlining its
  * code on the host, where the TypeScript compiler already runs for the import

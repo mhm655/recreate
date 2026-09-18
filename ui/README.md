@@ -12,7 +12,7 @@ concerns of its own.
 ## Why there's a server here
 
 The harness's core functions (`captureChallenge`, `gradeAgainstChallenge`, ...) run
-real untrusted TypeScript through Node child processes / worker threads and touch
+real untrusted TypeScript through Node child processes and touch
 `fs`, `node:crypto`, `Buffer`. None of that can run in a browser. `server/app.ts` is
 a thin Express layer that calls the harness on the server; the React app in `src/`
 only ever talks to its JSON endpoints, never imports the harness directly.

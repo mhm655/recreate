@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 
 import type { SandboxRequest } from '../protocol';
+import { supervisePass, type Attempt, type AttemptExit, type SpawnedAttempt } from './supervise';
 
 export interface RunnerResult {
   /** Raw bytes read from the result channel. Untrusted. */
@@ -41,25 +42,24 @@ const HARNESS_ENTRY = path.join(__dirname, '..', 'sandbox', 'harness.js');
  * Node flags the harness runs under, both here and in the image ENTRYPOINT
  * (docker/Dockerfile -- keep the two in sync).
  *
- * `--disallow-code-generation-from-strings` is process-wide and inherited by worker
- * threads. The vm context already refuses `eval`/`new Function`; this extends the
- * same refusal to the worker's own realm, so code that escapes the context still
- * cannot turn `Function('return process')` into a handle on Node.
+ * `--disallow-code-generation-from-strings` is process-wide. The vm context
+ * already refuses `eval`/`new Function`; this extends the same refusal to the
+ * sandbox's own top-level realm, so code that escapes the context still cannot
+ * turn `Function('return process')` into a handle on Node.
  *
- * Considered and rejected: Node's `--permission` model. Worker threads require
- * `--allow-worker`, which Node itself warns "could invalidate the permission model".
- * A layer that is documented as bypassable in exactly this configuration would be
- * decoration, not defence.
+ * Considered and rejected: Node's `--permission` model. It would need to be
+ * disabled for the sandbox's own legitimate fs/stdio use anyway, at which point it
+ * is decoration, not defence.
  */
 export const SANDBOX_NODE_FLAGS: readonly string[] = ['--disallow-code-generation-from-strings'];
 
 /**
- * Runs the harness as a plain child process on this machine.
+ * Runs the sandbox as a plain child process on this machine.
  *
  * !! THIS PROVIDES NO SECURITY ISOLATION !!
  *
  * It has the same filesystem, network and credentials as the developer running it.
- * It exists so the inner mechanics -- worker termination, heap caps, the tagged
+ * It exists so the inner mechanics -- per-test timeouts, memory limits, the tagged
  * encoding, result-channel reconciliation -- can be exercised on a workstation
  * without a Linux host and gVisor, and so those mechanics are covered by tests that
  * run in CI. Every report produced through it is stamped `isolated: false`, and the
@@ -96,9 +96,32 @@ export class LocalRunner implements SandboxRunner {
   }
 
   run(request: SandboxRequest, timeoutMs: number): Promise<RunnerResult> {
-    const started = Date.now();
-    return new Promise<RunnerResult>((resolve) => {
-      const child = spawn(this.nodeExecutable, [...SANDBOX_NODE_FLAGS, ...this.nodeArgs, HARNESS_ENTRY], {
+    return supervisePass({
+      tests: request.tests,
+      limits: request.limits,
+      hostTimeoutMs: timeoutMs,
+      // Matches STARTUP_GRACE_MS.local in host/orchestrator.ts: a plain child
+      // process's cold start (module loading, JIT warmup) is a real, variable cost
+      // that isn't the submission's fault.
+      startupGraceMs: 8_000,
+      passId: request.passId,
+      spawnAttempt: (tests, generation) => this.spawnOne(request, tests, generation),
+    });
+  }
+
+  private spawnOne(request: SandboxRequest, tests: SandboxRequest['tests'], generation: number): SpawnedAttempt {
+    const attemptRequest: SandboxRequest = { ...request, tests, generation };
+    const cap = request.limits.maxResultBytes;
+
+    const child = spawn(
+      this.nodeExecutable,
+      [
+        ...SANDBOX_NODE_FLAGS,
+        `--max-old-space-size=${request.limits.workerMaxOldGenerationMb}`,
+        ...this.nodeArgs,
+        HARNESS_ENTRY,
+      ],
+      {
         // fd 3 is a dedicated pipe for results; fd 1 carries console output only.
         stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
         env: {
@@ -107,56 +130,50 @@ export class LocalRunner implements SandboxRunner {
           SANDBOX_RESULT_FD: '3',
           NODE_OPTIONS: '',
         },
-      });
+      },
+    );
 
-      let resultChannel = '';
-      let rawOutput = '';
-      let hostTimedOut = false;
+    const resultCallbacks: Array<(chunk: string) => void> = [];
+    const rawCallbacks: Array<(chunk: string) => void> = [];
+    let resultBytes = 0;
+
+    const resultStream = child.stdio[3] as NodeJS.ReadableStream | null;
+    resultStream?.on('data', (chunk: Buffer) => {
+      if (resultBytes >= cap) return;
+      resultBytes += chunk.byteLength;
+      const text = chunk.toString('utf8');
+      for (const cb of resultCallbacks) cb(text);
+    });
+    resultStream?.on('error', () => {});
+    child.stdout?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8');
+      for (const cb of rawCallbacks) cb(text);
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8');
+      for (const cb of rawCallbacks) cb(text);
+    });
+
+    const exited = new Promise<AttemptExit>((resolve) => {
       let settled = false;
-
-      const cap = request.limits.maxResultBytes;
-      const rawCap = request.limits.maxRawOutputBytes;
-
-      const resultStream = child.stdio[3] as NodeJS.ReadableStream | null;
-      if (resultStream) {
-        resultStream.on('data', (chunk: Buffer) => {
-          if (resultChannel.length < cap) resultChannel += chunk.toString('utf8');
-        });
-        resultStream.on('error', () => {});
-      }
-      child.stdout?.on('data', (chunk: Buffer) => {
-        if (rawOutput.length < rawCap) rawOutput += chunk.toString('utf8');
-      });
-      child.stderr?.on('data', (chunk: Buffer) => {
-        if (rawOutput.length < rawCap) rawOutput += chunk.toString('utf8');
-      });
-
-      const timer = setTimeout(() => {
-        hostTimedOut = true;
-        child.kill('SIGKILL');
-      }, timeoutMs);
-
       const finish = (exitCode: number | null, signal: string | null, startupError?: string) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
-        resolve({
-          resultChannel,
-          rawOutput,
-          exitCode,
-          signal,
-          hostTimedOut,
-          oomKilled: false,
-          startupError,
-          wallMs: Date.now() - started,
-        });
+        resolve({ exitCode, signal, oomKilled: false, startupError });
       };
-
       child.on('error', (err) => finish(null, null, `spawn failed: ${err.message}`));
       child.on('close', (code, signal) => finish(code, signal));
-
-      child.stdin?.on('error', () => {});
-      child.stdin?.end(JSON.stringify(request));
     });
+
+    const attempt: Attempt = { exited, kill: () => child.kill('SIGKILL') };
+
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(JSON.stringify(attemptRequest));
+
+    return {
+      attempt,
+      onResultData: (cb) => resultCallbacks.push(cb),
+      onRawData: (cb) => rawCallbacks.push(cb),
+    };
   }
 }

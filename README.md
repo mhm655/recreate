@@ -14,39 +14,47 @@ A small local demo UI lives in [`ui/`](ui/README.md) -- a separate package that 
 
 ## Security model
 
-Each layer has one job. Two of them are **not** security boundaries, and the code says so wherever it touches them.
+Each layer has one job. Some of them are **not** security boundaries, and the code says so wherever it touches them.
+
+The sandbox is a **single, wholly untrusted process** -- there is no privileged component inside it holding a secret. Earlier versions split it into a privileged "harness" thread (held a per-pass HMAC signing key, verified every result line) and an unprivileged "worker" thread (ran the submission), on the theory that a worker thread sharing its parent's OS process, address space and file descriptors is still safer than nothing. It wasn't: reaching the surrounding realm from inside the `vm` context (already not a boundary -- see below) put `fs`/`process` back in reach, and from there `fs.readFileSync('/proc/self/mem')` could recover the key just as easily as it could forge an unsigned line, because both live in the same process either way. Removing the split removes that exposure by construction: there is nothing secret inside the sandbox process for an escape to find, and per-test timeouts and memory limits are now enforced by the **host**, from outside, by killing the whole sandbox process/container when it stops making progress (`src/host/supervise.ts`) -- see "Why there's no signing key any more" below.
 
 | Layer | Job | Security boundary? |
 |---|---|---|
 | **Static import allowlist** (host) | Reject module references outside an explicit allowlist before any container exists | No. It gives early, readable errors. The global-identifier check is a best-effort blocklist and is trivially bypassed. |
 | **gVisor container** (`runsc`) | Isolate untrusted code from the host kernel: no network, read-only rootfs, noexec tmpfs, non-root, `cap-drop=ALL`, `no-new-privileges`, seccomp, memory/CPU/pid cgroups | **Yes. This is the boundary.** |
 | **Seccomp profile** | Allowlist of syscalls. `clone` is allowed only for threads, so glibc `fork()` and libuv (and so `child_process`) can't create a process. `clone3` has to be allowed under gVisor and can't be filtered, so a raw `clone3` from native code isn't covered | Yes, defence in depth under gVisor |
-| **Worker thread** | *Interruptibility.* A synchronous `while(true){}` never yields, so no timer on its own thread can fire. The parent thread calls `worker.terminate()` | **No.** It shares the process, its file descriptors and its address space |
 | **`vm` context** | *Realm hygiene.* Fresh intrinsics, no `require`/`process`/timers, string code generation disabled. Prototype pollution can't corrupt the encoder or message plumbing | **No.** `vm` is not a sandbox |
-| **Result-channel HMAC + id reconciliation** (host) | Stop a submission from fabricating its own results | No. It protects the integrity of the *report* (see [Known limitations](#known-limitations)) |
+| **Id-set reconciliation** (host) | Confirm the sandbox reported exactly the expected test ids -- no more, no fewer, no duplicates | No. It protects the integrity of the *report*, not the host; see "Why there's no signing key any more" below |
 
 ```mermaid
 flowchart LR
   subgraph host [Host]
     CLI[CLI / evaluate] --> G[import allowlist] --> TS[transpile TS to JS] --> O[orchestrator]
-    O -- "pass A: original order" --> R
-    O -- "pass B: seeded shuffle" --> R
-    R[reconcile: HMAC, exact id set, exit/OOM] --> C[compare A vs B] --> REP[report]
+    O -- "pass A: original order" --> S
+    O -- "pass B: seeded shuffle" --> S
+    S[supervise: per-test timeout,<br/>memory watchdog, retry] --> R
+    R[reconcile: exact id set, exit/OOM] --> C[compare A vs B] --> REP[report]
   end
-  subgraph box [gVisor container, one per pass]
-    H["harness (main thread)<br/>owns result fd, timers,<br/>RSS watchdog"] -- postMessage --> W["worker thread<br/>vm context runs submission"]
-    W -- "done / killed" --> H
+  subgraph box [gVisor container, one per attempt]
+    SB["sandbox (single process)<br/>vm context runs submission,<br/>self-reports heartbeat + results"]
   end
-  O -- "stdin: request + per-pass key" --> H
-  H -- "result fd: signed NDJSON" --> R
-  W -. "console to raw fd (capped)" .-> O
+  O -- "stdin: request" --> SB
+  SB -- "result fd: unsigned NDJSON" --> S
+  S -. "kills and retries with remaining tests on hang/OOM" .-> box
+  SB -. "console to raw fd (capped)" .-> O
 ```
 
-### Why each pass gets a fresh container
+### Why there's no signing key any more
 
-Both passes run the whole test list, pass A in the original order and pass B in a seeded shuffle. Each pass gets **its own container and its own worker**, so state can't leak between passes through module scope, prototypes or the tmpfs. The two passes run **concurrently** (`Promise.all`), not one after the other -- nothing about pass B depends on pass A's results, only on the seed, so there is no reason to pay the sum of both passes' wall time instead of the max of the two.
+The old design's HMAC key existed to let the host tell "the privileged harness thread's own line" apart from "the unprivileged worker thread writing to the same fd" -- both could reach it, because file descriptors are process-wide. That distinction no longer exists to make: the sandbox is one process end to end, so every byte on the result channel is equally the sandbox's *own* self-report, genuine or not. What still matters -- and what a signature never actually verified, even before -- is whether the reported test-id set is exactly the one asked for: no fewer (a partial run reported as if it were the whole thing), no more (a phantom result for a test that was never run), no duplicates (a replayed line). That's `reconcile()`'s job (`src/host/orchestrator.ts`), unchanged in kind, and the channel it reads is a private pipe the host itself created for exactly one sandbox instance -- nothing else has a handle to write to it, signed or not.
 
-Within a pass, one worker runs every test **on purpose**. Module-level counters, memo caches and prototype pollution are *meant* to persist between tests there, because that leakage is exactly what comparing the two passes detects. Any test whose outcome or post-call arguments differ between passes sets the verdict to `nondeterministic`. The report records no single answer for it.
+### Why each pass gets a fresh container -- and sometimes more than one
+
+Both passes run the whole test list, pass A in the original order and pass B in a seeded shuffle. Each pass gets **its own container**, so state can't leak between passes through module scope, prototypes or the tmpfs. The two passes run **concurrently** (`Promise.all`), not one after the other -- nothing about pass B depends on pass A's results, only on the seed, so there is no reason to pay the sum of both passes' wall time instead of the max of the two.
+
+Within a pass, one sandbox process runs every test **on purpose**. Module-level counters, memo caches and prototype pollution are *meant* to persist between tests there, because that leakage is exactly what comparing the two passes detects. Any test whose outcome or post-call arguments differ between passes sets the verdict to `nondeterministic`. The report records no single answer for it.
+
+If a test hangs or exhausts memory, there's no longer a live thread inside that same process able to recover from it (see the Security model section above) -- the host kills the whole process/container instead, attributes a clean outcome to whichever test was in flight, and starts a **fresh** one with only the remaining tests, exactly as `workerGeneration` already reported a worker being replaced mid-pass. Well-behaved code never hits this path at all; a hostile or resource-exhausting one now pays a container respawn instead of a worker-thread respawn, which is slower but not the common case.
 
 ---
 
@@ -87,7 +95,7 @@ Within a pass, one worker runs every test **on purpose**. Module-level counters,
 ```
 
 The script builds everything, then:
-- runs `tsbox verify-isolation`, which probes the isolation claims from **inside** a container launched with the production flags: non-root, read-only rootfs, no network, process creation blocked, worker threads still working, gVisor kernel;
+- runs `tsbox verify-isolation`, which probes the isolation claims from **inside** a container launched with the production flags: non-root, read-only rootfs, no network, process creation blocked, gVisor kernel;
 - runs the examples;
 - runs the full hostile suite against Docker.
 
@@ -100,7 +108,7 @@ npm install
 npm test
 ```
 
-`npm test` uses `LocalRunner`, which runs the harness as a plain child process. **It provides no isolation.** It exists so worker termination, heap caps, the watchdog, encoding and reconciliation can all be tested on a workstation. Every report it produces is stamped `isolated: false`, and the CLI refuses it without `--unsafe-local`.
+`npm test` uses `LocalRunner`, which runs the sandbox as a plain child process. **It provides no isolation.** It exists so host-side per-test timeouts, the memory watchdog, encoding and reconciliation can all be tested on a workstation. Every report it produces is stamped `isolated: false`, and the CLI refuses it without `--unsafe-local`.
 
 ---
 
@@ -178,15 +186,15 @@ Limits are layered, so whichever layer trips first reports most specifically. Th
 
 | Limit | Default | Enforced by | Reported as |
 |---|---|---|---|
-| Per-test wall clock | 1 s | harness timer → `worker.terminate()` | outcome `timeout`; a fresh worker continues the pass |
-| Per-pass wall clock | 30 s | harness timer | `sandbox_pass_timeout` problem, remaining tests missing → pass `incomplete` |
+| Per-test wall clock | 1 s | host, from outside: kills the sandbox process/container (`src/host/supervise.ts`) -- nothing lives inside it any more that could recover from its own hang | outcome `timeout`; a fresh sandbox continues the pass with the remaining tests |
+| Per-pass wall clock | 30 s | host, across every attempt the pass makes | remaining tests missing → pass `incomplete` |
 | Per-submission wall clock | 120 s | host; `docker kill` on overrun | pass `resource_limit_exceeded` / `submission_timeout` |
-| Worker V8 heap | 64 MB old + 16 MB young | `resourceLimits` on the worker | outcome `resource_limit: memory` |
-| Process RSS (off-heap, e.g. ArrayBuffers) | 192 MB | watchdog in harness main thread, 10 ms poll | outcome `resource_limit: memory` |
-| Container memory (no swap) | 256 MB | cgroup | pass `resource_limit_exceeded` + `container_oom` |
+| Sandbox V8 heap | 64 MB old space | `--max-old-space-size`, set by the host per request | outcome `resource_limit: memory` (the host recognises V8's own fatal-error message) |
+| Process RSS (off-heap, e.g. ArrayBuffers) | 192 MB | sandbox self-reports via periodic `heartbeat` lines; host kills it if a report exceeds the cap | outcome `resource_limit: memory` when the sandbox got to report at least once; `timeout` if it never yielded long enough to (see README's Security model section) |
+| Container memory (no swap) | 256 MB | cgroup | outcome `resource_limit: memory` for the in-flight test (DockerRunner inspects `OOMKilled`); pass stays `ok` if nothing else was lost |
 | CPU | 1 CPU | cgroup (throttles; the timeouts catch the effect) | via timeouts |
 | Tasks (threads + processes) | 128 | `--pids-limit` | seccomp already blocks processes; backstop |
-| Console capture | 8 KB/test, 256 KB raw | harness | truncated with a marker |
+| Console capture | 8 KB/test, 256 KB raw | sandbox | truncated with a marker |
 | Result payload | 8 MB | host reader + parser | `result_channel_truncated` → pass not `ok` |
 | Encoded value size | 20k nodes, depth 32, 16 KB strings | encoder | `{t:'truncated'}` markers |
 | Source size | 256 KB | import guard | `source-too-large` |
@@ -291,9 +299,9 @@ node dist/src/cli.js grade --challenge challenge.json --rewrite candidate.ts
 
 ### Result channel
 
-- **Separate descriptor.** Results never share a descriptor with untrusted console output. Locally the harness writes results to a real fd 3 and console to fd 1. `docker run` forwards exactly three descriptors, so in the container results go on fd 1 and all worker stdio goes to fd 2 (`SANDBOX_RESULT_FD=1`). In both cases only the trusted main thread writes to the result descriptor.
-- **Signed lines.** Each line is `<hmac-sha256> <json>`. The key is fresh for each pass, arrives on stdin, and lives only in the main thread's JS heap: never in env, `workerData` or on disk. The worker can still write to the fd, because fds are process-wide. It can't sign what it writes.
-- **Minimal parsing.** The host uses plain `JSON.parse` under a byte cap and nothing more capable. A partial final line from a container killed mid-write counts as truncation, not tampering.
+- **Separate descriptor.** Results never share a descriptor with untrusted console output. Locally the sandbox writes results to a real fd 3 and console to fd 1. `docker run` forwards exactly three descriptors, so in the container results go on fd 1 and all sandbox stdio goes to fd 2 (`SANDBOX_RESULT_FD=1`).
+- **Unsigned lines.** Each line is plain `<json>`. There is no signing key any more -- see the Security model section for why removing the sandbox's internal privileged/unprivileged split removed the need for one, not just the key itself.
+- **Minimal parsing.** The host uses plain `JSON.parse` under a byte cap and nothing more capable. A partial final line from a sandbox killed mid-write counts as truncation, not a malformed line.
 - **Exact reconciliation.** The returned test-id set must match the expected one exactly: nothing missing, nothing extra, no duplicates. A partial result set is a failed run. "Every test that came back passed" is exactly what an attacker would try to engineer.
 
 ### Tagged encoding
@@ -304,11 +312,11 @@ The encoder is **realm-agnostic**: it uses `Object.prototype.toString` and own d
 
 ### Transpiling on the host
 
-The host already parses the untrusted source with the TypeScript compiler for the allowlist check, so emitting JS there adds little attack surface. In return, the image ships no `node_modules`, the worker's heap budget goes to the submission, and a replacement worker starts in milliseconds.
+The host already parses the untrusted source with the TypeScript compiler for the allowlist check, so emitting JS there adds little attack surface. In return, the image ships no `node_modules` and the sandbox's whole heap budget goes to the submission.
 
 ### Deferred microtasks
 
-`Promise.resolve().then(() => { while (true) {} })` returns instantly. If the worker replied right away, the next test would be blamed for the hang. So before reporting, the worker yields once to the macrotask queue, which only happens after every queued microtask has run. The hostile suite covers this case.
+`Promise.resolve().then(() => { while (true) {} })` returns instantly. If the sandbox replied right away, the next test would be blamed for the hang. So before reporting, it yields once to the macrotask queue, which only happens after every queued microtask has run. The hostile suite covers this case.
 
 ### Import allowlist
 
@@ -320,13 +328,13 @@ The allowlist only permits a module *statically*. Making an allowed module *avai
 
 A submission can `import` a small, explicit set of vetted npm packages -- `lodash-es`, `date-fns`, `ms` -- listed in `VENDORED_MODULES` (`src/bundle.ts`). Adding one there is a supply-chain decision, not a config toggle: the package's code runs, inlined, as part of every submission that imports it, so vet it (and its own dependencies) first.
 
-**How it stays consistent with "no node_modules in the image, no runtime require":** after the host transpiles a submission to CommonJS (as it always has), `bundleSubmission` runs esbuild over that output with `bundle: true`, resolving vendored specifiers against the *host's* `node_modules` and inlining them. The worker never sees a `require` of anything real -- it gets one self-contained script, same as before this feature existed. A test (`every vendored module is actually installed`, in `test/bundle.test.ts`) fails the build if `VENDORED_MODULES` ever lists something not actually in `package.json`.
+**How it stays consistent with "no node_modules in the image, no runtime require":** after the host transpiles a submission to CommonJS (as it always has), `bundleSubmission` runs esbuild over that output with `bundle: true`, resolving vendored specifiers against the *host's* `node_modules` and inlining them. The sandbox never sees a `require` of anything real -- it gets one self-contained script, same as before this feature existed. A test (`every vendored module is actually installed`, in `test/bundle.test.ts`) fails the build if `VENDORED_MODULES` ever lists something not actually in `package.json`.
 
 Only modules that pass `checkSource`'s allowlist reach the bundler at all, so a specifier that isn't in `VENDORED_MODULES` is rejected before any bundling is attempted -- there is no path where the bundler is asked to resolve something arbitrary.
 
 **Known cost:** `lodash-es`'s own module graph is not fully tree-shakeable by esbuild (its internals share state through a single `lodash.js` object), so importing even one function currently inlines most of the library (tens of KB). That's a size/startup cost, not a correctness or security one; a future version could switch to per-function `lodash-es/<fn>.js` imports or a different vetted library if that cost matters.
 
-**One realm quirk this surfaced:** `lodash-es`'s root-detection code falls back to `Function('return this')()` when it can't find `global` or `self`. The vm context (`src/sandbox/worker.ts`) disables string code generation, so that fallback would throw. The fix is a one-line alias, `globalThis.global = globalThis`, added to the context before any submission code runs -- it does not add a capability, since `global` here is just another name for the same restricted realm.
+**One realm quirk this surfaced:** `lodash-es`'s root-detection code falls back to `Function('return this')()` when it can't find `global` or `self`. The vm context (`src/sandbox/harness.ts`) disables string code generation, so that fallback would throw. The fix is a one-line alias, `globalThis.global = globalThis`, added to the context before any submission code runs -- it does not add a capability, since `global` here is just another name for the same restricted realm.
 
 **One interop bug adding `date-fns` and `ms` surfaced:** `date-fns` (a real ES module) worked immediately; `ms` is legacy CommonJS (`module.exports = fn`, no `.default`), and `import ms from 'ms'` transpiled into code reading a `.default` property that plain CJS modules don't have -- it threw `"is not a function"` at runtime despite transpiling and bundling cleanly. `src/transpile.ts` never set `esModuleInterop`, so TypeScript's usual handling for exactly this case (wrapping a plain CJS export as `{ default: ... }` via its `__importDefault` helper) never ran. Fixed by enabling it there; verified against both a named-export (`lodash-es`, `date-fns`) and a default-import (`ms`) dependency so the fix covers both shapes, not just the one that broke.
 
@@ -338,11 +346,12 @@ Only modules that pass `checkSource`'s allowlist reach the bundler at all, so a 
 
 | Attack | What stops it | Verified locally | Verified on gVisor |
 |---|---|---|---|
-| `while(true){}` | per-test timer → `worker.terminate()`; fresh worker continues | ✅ | run `check-sandbox.sh` |
+| `while(true){}` | host silence-timeout kills the sandbox process/container; a fresh one continues with the remaining tests | ✅ | run `check-sandbox.sh` |
 | Hang deferred into a microtask | macrotask yield before reply; timeout blamed on the right test | ✅ | ″ |
-| Unbounded array growth | worker V8 heap cap | ✅ | ″ |
-| Off-heap `Uint8Array` growth | RSS watchdog | ✅ | ″ |
-| Allocation outrunning every in-sandbox cap | container cgroup → `resource_limit_exceeded` | reconciliation unit-tested | Docker-only test |
+| Unbounded array growth | sandbox V8 heap cap (`--max-old-space-size`); host recognises V8's own fatal-error message on stderr | ✅ | ″ |
+| Off-heap `Uint8Array` growth that yields to the event loop | host-side RSS watchdog, via the sandbox's own `heartbeat` self-reports | ✅ | ″ |
+| Off-heap growth that never yields at all | caught as a host silence-timeout instead (honest precision limit under LocalRunner -- no live thread left inside to poll it, and a fully synchronous loop never sends a heartbeat either) | ✅ (asserted as `timeout`, not `resource_limit`) | precise `resource_limit`/`memory` recovered via the container's own `OOMKilled` |
+| Allocation outrunning every in-sandbox cap | container cgroup; DockerRunner inspects `OOMKilled` and attributes a clean outcome to the in-flight test, pass stays `ok` | reconciliation unit-tested | Docker-only test |
 | `require('child_process')`, aliased, string-built, via `globalThis`, `import()`, `eval`, `process.binding` | static allowlist, rejected before launch (asserted: no sandbox is started) | ✅ | n/a (host-side) |
 | `(function(){}).constructor('return process')()` and similar, which *pass* static analysis | vm context with string code generation disabled → `EvalError` | ✅ | ″ |
 | All of the above with static analysis **bypassed** | no `require`/`process`/`module` in the realm | ✅ | ″ |
@@ -350,16 +359,16 @@ Only modules that pass `checkSource`'s allowlist reach the bundler at all, so a 
 | Returns `NaN`, `±Infinity`, `-0`, `undefined`; throws non-Errors | tagged encoding, both into and out of the sandbox | ✅ | ″ |
 | Mutates its arguments | `argsAfterCall` | ✅ | ″ |
 | Module-level counter, memo cache | shuffled second pass → `nondeterministic` | ✅ | ″ |
-| Garbage, unsigned forgeries, dropped or duplicated lines, **and a signed extra entry with a leaked key**, all written to the real result fd from inside the sandbox process | HMAC + exact id reconciliation | ✅ | tamper tests are local-only by design |
+| Garbage, dropped or duplicated lines, and a well-formed extra entry for a test that was never asked for, all written to the real result fd from inside the sandbox process | exact id-set reconciliation (no signature to defeat any more -- see the Security model section) | ✅ | tamper tests are local-only by design |
 
-The tamper tests inject a `--require` preload into the sandbox process. It attacks the real result descriptor while the real harness runs, and each test also asserts the harness completed, so a crashed preload can't pass for a caught attack.
+The tamper tests inject a `--require` preload into the sandbox process. It attacks the real result descriptor while the real sandbox script runs, and each test also asserts the sandbox completed, so a crashed preload can't pass for a caught attack.
 
 ### Verification status
 
 - **Windows 10 / Node 26:** the full suite via `LocalRunner`, plus the CLI paths.
 - **CI, GitHub Ubuntu runners with gVisor `release-20260907.0` and `--oci-seccomp`** ([workflow](.github/workflows/sandbox.yml)):
   - the full local suite;
-  - `verify-isolation` from inside a production-flagged container: non-root, read-only root mount, no network egress (`EPERM`), process creation blocked (`EPERM`), worker threads working, gVisor kernel;
+  - `verify-isolation` from inside a production-flagged container: non-root, read-only root mount, no network egress (`EPERM`), process creation blocked (`EPERM`), gVisor kernel;
   - both examples;
   - the hostile suite against Docker, including the container OOM test.
 
@@ -370,21 +379,21 @@ The tamper tests inject a `--require` preload into the sandbox process. It attac
 
 ## Known limitations
 
-- **The result-channel key is not a hard boundary.** The key lives in a thread of the same OS process as the untrusted code, and code that fully escapes the vm context could read it back from `/proc/self/mem`. With the key, an attacker can **substitute** a plausible result for a real one, and reconciliation can't detect that (extra and duplicate entries are still caught; see the `extra-signed` test). That's acceptable only because gVisor is the boundary and the escape has to happen first. The robust fix is to run the submission in a **child process** instead of a worker thread, so the result descriptor can be withheld entirely. That departs from this session's spec, so it's future work.
 - **gVisor fails open if misconfigured.** Without `--oci-seccomp`, the seccomp profile is silently ignored. Run `verify-isolation`.
-- **Node's `--permission` model was considered and rejected.** Worker threads need `--allow-worker`, which Node warns "could invalidate the permission model".
+- **Node's `--permission` model was considered and rejected.** It would need to be disabled for the sandbox's own legitimate fs/stdio use (reading the request, writing results) anyway, at which point it is decoration, not defence.
+- **A fully synchronous, non-yielding off-heap memory bomb under `LocalRunner` is caught as a `timeout`, not attributed to `resource_limit: memory`.** With no privileged thread left alive inside the sandbox to poll its own RSS (see the Security model section), the host can only detect memory growth via the sandbox's own `heartbeat` self-reports, or -- for `DockerRunner` only -- by inspecting the dead container's `OOMKilled` flag afterward. A loop with no `await`/yield point never returns to the event loop long enough to send a heartbeat, so from the host's side it's indistinguishable from any other hang, and `LocalRunner` has no cgroup to inspect after the fact. Safe either way (the sandbox is still killed and the pass still recovers), just less precisely attributed than under `DockerRunner`, which is the isolated, security-meaningful path anyway.
 - **Base images are tag-pinned, not digest-pinned.** Pin both `FROM` lines to `@sha256:` digests for production.
 
 ## Decisions for the next layers
 
 Decided (2026-09-16):
 
-1. **An order-sensitive original is rejected as an oracle,** with the divergences as the reason. A per-test fresh-worker mode is possible later if real functions need it.
+1. **An order-sensitive original is rejected as an oracle,** with the divergences as the reason. A per-test fresh-sandbox mode is possible later if real functions need it.
 2. **Time and randomness will be frozen or seeded inside the sandbox realm,** so functions using `Date.now()` or `Math.random()` become testable. *Not implemented yet:* until then the analyzer lists these call sites and the harness flags such functions `nondeterministic`.
 3. **Thrown errors match on error class plus normalised message.** Class-only matching can be a per-challenge option.
 4. **Inputs on which the original times out are dropped** during generation instead of being kept as expected timeouts.
 
-5. **Real dependencies are supported through host-side bundling, not a runtime resolver.** A short vetted list (`VENDORED_MODULES`, currently `lodash-es`) is inlined into the transpiled submission by esbuild before it reaches the worker, so the sandbox still ships no `node_modules` and `require` still throws in the realm. See "Vendored dependencies" above. Extending the list is a per-package vetting decision, not a mechanism change.
+5. **Real dependencies are supported through host-side bundling, not a runtime resolver.** A short vetted list (`VENDORED_MODULES`, currently `lodash-es`) is inlined into the transpiled submission by esbuild before it reaches the sandbox, so the sandbox still ships no `node_modules` and `require` still throws in the realm. See "Vendored dependencies" above. Extending the list is a per-package vetting decision, not a mechanism change.
 6. **A live function argument still cannot cross into the sandbox -- there is no channel to call back out to it -- but a *bounded, pre-computed record* of what it did for a known set of inputs now can.** `recordCalls(fn, inputs)` (`src/encoding.ts`) calls `fn` once per input right now, on the host, and returns a function that -- once encoded as a test argument and decoded inside the sandbox -- replays the matching recorded outcome (return value or thrown error) for a call whose arguments match, and throws the same loud, attributable "cannot be reconstructed" failure as before for any call outside that table. This covers `map`/`filter`/`forEach`-style callback parameters, where the caller already knows exactly what elements the callback will be called with; matching is on however many arguments each recorded entry has, not full arity, since those array methods call their callback as `(element, index, array)` and recording just the element is normally what's meant. It does *not* cover a callback the submission calls with values it computes itself (there is nothing to record those against) -- that still fails loudly, which is the right behaviour for an argument that was never going to be safe to fabricate an answer for.
    Reachable only through the JS API's hand-authored `TestCase[]` (`evaluate()`/`gradeSubmission()`): `generateTests` still cannot invent a meaningful callback implementation on its own, so a required function-typed parameter is still a generator blocker, and `captureChallenge` -- which always builds its test list via `generateTests` -- never produces one either. A class instance argument still decodes to a plain object with `ctor` recorded and no methods; attaching a `recordCalls`-wrapped function as an own property before passing the instance works today with no further changes (it's encoded exactly like a bare callback argument, since object properties are encoded recursively), but there's no dedicated ergonomic helper for that yet.
 
@@ -395,15 +404,15 @@ Decided (2026-09-16):
 ```
 src/
   encoding.ts          tagged encoder/decoder (host + sandbox)
-  channel.ts           HMAC framing + capped parsing of the result channel
+  channel.ts           plain NDJSON framing + capped parsing of the result channel
   protocol.ts          wire types and default limits
   import-guard.ts      static allowlist + entry-point resolution (host)
   transpile.ts         TS -> JS (host)
   bundle.ts            inlines vendored dependencies into the submission (host)
-  sandbox/harness.ts   container main thread: result fd, timers, watchdog, worker supervision
-  sandbox/worker.ts    worker thread: vm context, runs one test at a time
+  sandbox/harness.ts   the whole sandbox: vm context, runs every test, self-reports via the result fd
   host/runner.ts       runner interface + LocalRunner (NO isolation)
   host/docker-runner.ts gVisor container runner + verify-isolation probes
+  host/supervise.ts    per-test timeout + memory watchdog + retry, from outside the sandbox
   host/orchestrator.ts two passes, reconciliation, comparison, report
   analyzer/            static signature/type analysis for input generation (host, no execution)
   generator/           input generation from FunctionAnalysis (host, no execution)

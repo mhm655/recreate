@@ -307,7 +307,7 @@ function render(report: SubmissionReport): string {
   }
 
   for (const pass of report.passes) {
-    lines.push('', `pass ${pass.passId} (${pass.status}) -- ${pass.results.length} result(s), ${pass.workerGenerations} worker(s), ${pass.wallMs}ms`);
+    lines.push('', `pass ${pass.passId} (${pass.status}) -- ${pass.results.length} result(s), ${pass.workerGenerations} sandbox attempt(s), ${pass.wallMs}ms`);
     for (const r of pass.results) {
       lines.push(`  ${r.testId.padEnd(16)} ${summarize(r.outcome)}`);
     }
@@ -335,7 +335,7 @@ function summarize(outcome: SubmissionReport['passes'][number]['results'][number
   switch (outcome.type) {
     case 'return': return `returned ${describeEncoded(outcome.value)}`.slice(0, 160);
     case 'thrown': return `threw ${outcome.errorClass}: ${outcome.message}`.slice(0, 160);
-    case 'timeout': return `TIMEOUT after ${outcome.limitMs}ms (worker terminated)`;
+    case 'timeout': return `TIMEOUT after ${outcome.limitMs}ms (sandbox terminated)`;
     case 'resource_limit': return `RESOURCE LIMIT (${outcome.limit}): ${outcome.detail}`;
     case 'harness_error': return `HARNESS ERROR: ${outcome.detail}`;
     default: return 'unknown outcome';

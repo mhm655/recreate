@@ -39,11 +39,11 @@ describe('bundleSubmission', () => {
     if (!bundled.ok) return;
 
     // No remaining require() of the vendored package: it must be inlined, not left
-    // for a runtime `require` that the worker doesn't provide.
+    // for a runtime `require` that the sandbox doesn't provide.
     assert.ok(!/require\(\s*["']lodash-es["']\s*\)/.test(bundled.code));
 
     // The bundle runs standalone in a vm context configured the same way as the
-    // worker's (see src/sandbox/worker.ts): no string code generation, `exports`
+    // sandbox's (see src/sandbox/harness.ts): no string code generation, `exports`
     // and `module.exports` are the same object until reassigned, no real require.
     const moduleObj = { exports: {} as { firstPair?: (xs: number[]) => number[] } };
     const context = vm.createContext(
