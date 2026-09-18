@@ -373,6 +373,7 @@ The tamper tests inject a `--require` preload into the sandbox process. It attac
 
   The tamper and host-kill tests run only under `LocalRunner`, by design.
 - **What CI turned up:** gVisor with `--oci-seccomp` breaks Node under any profile that refuses `clone3`, Docker's default included. The profile now allows `clone3`, trading away some coverage (see the profile's comments). `scripts/diagnose-seccomp.sh` reproduces the finding and runs automatically in CI if the isolation checks ever fail.
+- **What CI turned up (again), removing the result-channel signing key:** a slower CI runner let the host's own per-test silence-timeout fire before V8 finished printing its heap-OOM message to stderr, so the sandbox got SIGKILLed for "no response" a moment before it would have exited on its own -- `src/host/supervise.ts` now checks for that message regardless of which kill reason actually fired, not only when the process died unprompted. Separately, two hostile-suite tests had only ever been run and asserted against `LocalRunner`'s honest-but-imprecise fallback; under `DockerRunner` they failed because the `OOMKilled`-based attribution is actually *more* precise, not because anything was broken. Neither is the kind of thing `LocalRunner` alone could have surfaced -- this workstation has no gVisor to test the container path against at all.
 
 ---
 
