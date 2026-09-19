@@ -16,6 +16,7 @@ import type { FunctionAnalysis } from './analyzer/types';
 import { checkSource } from './import-guard';
 import { VENDORED_MODULES } from './bundle';
 import { generateTests } from './generator/generate';
+import { suggestTestsWithLlm, type LlmSuggestOptions } from './generator/llm';
 import { gradeSubmission, type GradeReport } from './evaluator/grade';
 import { runMutationTests, type MutationTestReport } from './mutator/mutation-test';
 import { captureChallenge } from './challenge/capture';
@@ -35,6 +36,7 @@ tsbox -- sandboxed TypeScript execution harness
   tsbox analyze --source <file.ts> [--entry <name>] [--json]
                                     static signature/type analysis (no execution)
   tsbox generate --source <file.ts> [--entry <name>] [--seed <n>] [--max-tests <n>]
+                 [--llm [--llm-model <id>] [--llm-max <n>] [--llm-effort <level>]]
                  [--json] [--out <file.json>]
                                     generate a test-input suite for the function
                                     (see "Static analyzer" / "Input generation" in
@@ -52,6 +54,7 @@ tsbox -- sandboxed TypeScript execution harness
                                     (see "Mutation testing" in README.md)
   tsbox capture --source <file.ts> [--entry <name>] [--seed <n>] [--max-tests <n>]
                 [--mutate] [--max-mutants <n>] [--min-mutation-score <pct>]
+                [--llm [--llm-model <id>] [--llm-max <n>] [--llm-effort <level>]]
                 [--json] [--out <file.json>]
                                     capture the function's behaviour as a fixed,
                                     self-contained Challenge (see "Challenge data
@@ -78,6 +81,12 @@ Options
   --memory-mb <n>        Container memory cap
   --seccomp <path>       Seccomp profile path, or 'default' / 'unconfined'
   --allow <mod>          Add a module to the import allowlist (repeatable)
+  --llm                  generate/capture: also ask Claude for inputs aimed at the
+                         function's logic. Sends the source to the Anthropic API and
+                         costs tokens; needs ANTHROPIC_API_KEY or 'ant auth login'
+  --llm-model <id>       Model for --llm (default: claude-opus-5)
+  --llm-max <n>          Most LLM-proposed inputs to keep (default: 20)
+  --llm-effort <level>   low | medium | high | xhigh | max (default: API default)
   --json                 Emit the full report as JSON instead of a summary
   --help
 
@@ -101,7 +110,7 @@ const KNOWN_COMMANDS = new Set([
 ]);
 
 /** Flags that are pure presence switches (`has(args, k)`) and never take a value. */
-const BOOLEAN_FLAGS = new Set(['help', 'json', 'mutate', 'unsafe-local', 'unsafe-runtime']);
+const BOOLEAN_FLAGS = new Set(['help', 'json', 'mutate', 'llm', 'unsafe-local', 'unsafe-runtime']);
 
 export function parseArgs(argv: string[]): Args {
   const command = argv[0] && !argv[0].startsWith('-') ? argv[0] : 'help';
@@ -240,6 +249,37 @@ export function modulesFrom(a: Args): string[] {
 }
 
 /** --min-mutation-score takes a percentage (e.g. 90), converted to the [0,1] fraction captureChallenge expects. */
+const LLM_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** LLM options from --llm*, or undefined when --llm wasn't passed. */
+function llmOptionsFrom(a: Args): LlmSuggestOptions | undefined {
+  if (!has(a, 'llm')) {
+    for (const k of ['llm-model', 'llm-max', 'llm-effort']) {
+      if (has(a, k)) throw new Error(`--${k} only applies together with --llm`);
+    }
+    return undefined;
+  }
+  const effort = one(a, 'llm-effort');
+  if (effort !== undefined && !(LLM_EFFORTS as readonly string[]).includes(effort)) {
+    throw new Error(`--llm-effort must be one of ${LLM_EFFORTS.join(', ')}`);
+  }
+  const max = num(a, 'llm-max');
+  if (max !== undefined && (!Number.isInteger(max) || max < 1)) throw new Error('--llm-max must be a positive integer');
+  return { model: one(a, 'llm-model'), maxSuggestions: max, effort: effort as LlmSuggestOptions['effort'] };
+}
+
+function renderLlmSummary(
+  model: string,
+  accepted: number,
+  rejected: Array<{ name: string; reason: string }>,
+  usage?: { inputTokens: number; outputTokens: number },
+): string {
+  const tokens = usage ? ` (${usage.inputTokens} input / ${usage.outputTokens} output tokens)` : '';
+  const lines = [`llm     : ${accepted} input(s) proposed by ${model} kept, ${rejected.length} dropped${tokens}`];
+  for (const r of rejected) lines.push(`    dropped ${r.name}: ${r.reason}`);
+  return `${lines.join('\n')}\n`;
+}
+
 function minMutationScoreFrom(a: Args): number | undefined {
   const pct = num(a, 'min-mutation-score');
   return pct === undefined ? undefined : pct / 100;
@@ -406,6 +446,8 @@ function renderChallengeSummary(challenge: Challenge): string {
   lines.push(`challenge '${challenge.id}' for '${challenge.entryName}'`);
   lines.push(`  tests   : ${challenge.tests.length}`);
   if (challenge.droppedTestIds.length) lines.push(`  dropped : ${challenge.droppedTestIds.length} (oracle couldn't answer -- timeout/resource limit): ${challenge.droppedTestIds.join(', ')}`);
+  const llm = challenge.generation.llm;
+  if (llm) lines.push(`  ${renderLlmSummary(llm.model, llm.acceptedCount, llm.rejected).trimEnd().replace(/\n/g, '\n  ')}`);
   if (challenge.mutationTesting) {
     const m = challenge.mutationTesting;
     lines.push(`  mutation score : ${m.mutationScore === undefined ? 'n/a' : `${(m.mutationScore * 100).toFixed(1)}%`} (${m.killedCount} killed / ${m.killedCount + m.survivedCount} scoreable)`);
@@ -565,6 +607,7 @@ async function main(): Promise<number> {
       maxTests: num(args, 'max-tests'),
       mutationTest: has(args, 'mutate') ? { maxMutants: num(args, 'max-mutants'), seed: num(args, 'seed') } : false,
       minMutationScore: minMutationScoreFrom(args),
+      llm: llmOptionsFrom(args),
     });
 
     if (!result.ok) {
@@ -628,6 +671,19 @@ async function main(): Promise<number> {
       return 1;
     }
 
+    const llmOptions = llmOptionsFrom(args);
+    let llmNote = '';
+    if (llmOptions) {
+      const suggested = await suggestTestsWithLlm(source, analyzed.analysis, generated.tests, llmOptions);
+      if (!suggested.ok) {
+        process.stdout.write(`LLM input generation failed: ${suggested.reason}\n`);
+        return 1;
+      }
+      const r = suggested.report;
+      generated.tests.push(...r.accepted);
+      llmNote = renderLlmSummary(r.model, r.accepted.length, r.rejected, r.usage);
+    }
+
     const testsOut: TestCase[] = [];
     const skipped: string[] = [];
     for (const t of generated.tests) {
@@ -661,6 +717,8 @@ async function main(): Promise<number> {
       );
     }
     if (outPath) process.stdout.write(`wrote ${testsOut.length} test(s) to ${outPath}\n`);
+    // To stderr under --json, so the JSON payload on stdout stays parseable.
+    if (llmNote) (has(args, 'json') && !outPath ? process.stderr : process.stdout).write(llmNote);
     // A script relying on the exit code alone should be able to tell "generated
     // nothing usable" from success, even though the file/stdout payload alone
     // (an empty tests array) looks the same either way.

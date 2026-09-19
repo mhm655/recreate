@@ -41,6 +41,21 @@ export interface ChallengeMutationSummary {
   survived: Array<{ description: string; line: number; column: number }>;
 }
 
+/**
+ * Provenance for LLM-proposed inputs. Kept outside `tests`, so it doesn't affect the
+ * challenge's content id: two challenges with identical tests are the same challenge
+ * however the inputs were chosen.
+ */
+export interface ChallengeLlmSummary {
+  /** The model that actually answered (a refusal fallback may differ from the one requested). */
+  model: string;
+  acceptedCount: number;
+  /** Suggestions dropped before capture, with the reason (bad literal, wrong type, duplicate). */
+  rejected: Array<{ name: string; reason: string }>;
+  /** Test id -> the model's one-line reason for proposing that input. */
+  rationales: Record<string, string>;
+}
+
 export interface Challenge {
   schemaVersion: typeof CHALLENGE_SCHEMA_VERSION;
   /** Content hash of {entryName, allowedModules, tests}; see src/challenge/capture.ts. Stable identity for dedup, independent of when or how it was captured. */
@@ -59,6 +74,8 @@ export interface Challenge {
   droppedTestIds: string[];
   generation: {
     seed: number;
+    /** Present when Claude proposed some of the inputs (CaptureOptions.llm). */
+    llm?: ChallengeLlmSummary;
   };
   /**
    * How time and randomness were frozen when the oracle ran (see DeterminismSettings).

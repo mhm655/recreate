@@ -9,12 +9,18 @@ import { createHash } from 'node:crypto';
 import { analyzeIsolated } from '../analyzer/isolated';
 import { runOracle } from '../evaluator/compare';
 import { encodeArgs } from '../encoding';
-import { generateTests, type GenerateOptions } from '../generator/generate';
+import { generateTests, type GenerateOptions, type GeneratedTest } from '../generator/generate';
+import { suggestTestsWithLlm, type LlmSuggestOptions } from '../generator/llm';
 import type { EvaluateOptions } from '../host/orchestrator';
 import { DEFAULT_LIMITS } from '../protocol';
 import type { GenerateMutantsOptions } from '../mutator/mutate';
 import { runMutationTests } from '../mutator/mutation-test';
-import { CHALLENGE_SCHEMA_VERSION, type Challenge, type ChallengeMutationSummary } from './types';
+import {
+  CHALLENGE_SCHEMA_VERSION,
+  type Challenge,
+  type ChallengeLlmSummary,
+  type ChallengeMutationSummary,
+} from './types';
 
 export interface CaptureOptions {
   oracleSource: string;
@@ -42,6 +48,15 @@ export interface CaptureOptions {
    * suite to have missed.
    */
   minMutationScore?: number;
+  /**
+   * Also ask Claude for inputs aimed at the function's actual logic (see
+   * src/generator/llm.ts). Off by default: it sends the oracle source to the
+   * Anthropic API, costs tokens and needs credentials. Paid once here -- the
+   * accepted inputs are frozen into the challenge, so grading never calls the model.
+   * If it was requested and fails, capture fails rather than silently producing a
+   * weaker suite than was asked for.
+   */
+  llm?: boolean | LlmSuggestOptions;
 }
 
 export type CaptureResult = { ok: true; challenge: Challenge } | { ok: false; reason: string };
@@ -57,10 +72,26 @@ export async function captureChallenge(options: CaptureOptions): Promise<Capture
     return { ok: false, reason: `oracle rejected by static analysis: ${analysis.errors.map((e) => e.message).join('; ')}` };
   }
 
-  const generated = generateTests(analysis.analysis, { seed: options.seed, maxTests: options.maxTests });
-  if (!generated.ok) {
-    return { ok: false, reason: `oracle is not generatable: ${generated.reason}` };
+  const typed = generateTests(analysis.analysis, { seed: options.seed, maxTests: options.maxTests });
+  if (!typed.ok) {
+    return { ok: false, reason: `oracle is not generatable: ${typed.reason}` };
   }
+
+  let llmSummary: ChallengeLlmSummary | undefined;
+  let llmTests: GeneratedTest[] = [];
+  if (options.llm) {
+    const llmOptions = typeof options.llm === 'object' ? options.llm : {};
+    const suggested = await suggestTestsWithLlm(options.oracleSource, analysis.analysis, typed.tests, llmOptions);
+    if (!suggested.ok) return { ok: false, reason: `LLM input generation failed: ${suggested.reason}` };
+    llmTests = suggested.report.accepted;
+    llmSummary = {
+      model: suggested.report.model,
+      acceptedCount: suggested.report.accepted.length,
+      rejected: suggested.report.rejected,
+      rationales: Object.fromEntries(suggested.report.accepted.map((s) => [s.id, s.rationale])),
+    };
+  }
+  const generated = { entryName: typed.entryName, tests: [...typed.tests, ...llmTests] };
 
   const shared = {
     entryName: generated.entryName,
@@ -123,7 +154,7 @@ export async function captureChallenge(options: CaptureOptions): Promise<Capture
     allowedModules: [...(allowedModules ?? [])],
     tests,
     droppedTestIds,
-    generation: { seed: options.seed ?? 1 },
+    generation: { seed: options.seed ?? 1, ...(llmSummary ? { llm: llmSummary } : {}) },
     // The settings the oracle actually ran under, resolved exactly as evaluate()
     // resolves them, so grading can reproduce them.
     determinism: { ...DEFAULT_LIMITS.determinism, ...options.limits?.determinism },
