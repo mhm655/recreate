@@ -68,11 +68,19 @@ export function valuesFor(shape: TypeShape, rng: Rng, budget: ValueBudget = DEFA
     case 'array': {
       const el = valuesFor(shape.element, rng, budget, depth + 1);
       const sizes = uniqueSizes(budget.maxContainerSize);
-      return cap(
-        rng,
-        sizes.map((n) => Array.from({ length: n }, () => rng.pick(el))),
-        budget,
+      // Distinct elements where possible, so the longest array can't collapse to
+      // [x, x, x] and hide every ordering-dependent behaviour.
+      const arrays = sizes.map((n) =>
+        n >= 2 && el.length >= n ? rng.sample(el, n) : Array.from({ length: n }, () => rng.pick(el)),
       );
+      // The same elements in the opposite order, so anything order-dependent --
+      // sorting in place, reversing, keeping the first duplicate -- sees two
+      // orderings. Random picks alone can land on an already-sorted array; that is
+      // exactly how an in-place sort once passed a rewrite that returned a sorted
+      // copy (test/args-after.test.ts).
+      const longest = arrays[arrays.length - 1];
+      if (longest.length >= 2) arrays.push([...longest].reverse());
+      return cap(rng, arrays, budget);
     }
 
     case 'tuple': {
