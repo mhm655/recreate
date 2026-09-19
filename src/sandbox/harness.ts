@@ -309,6 +309,16 @@ function compile(req: SandboxRequest): Compiled {
   // here is the same restricted, freshly-captured realm as `globalThis`, not Node's.
   vm.runInContext('globalThis.global = globalThis', context);
 
+  // `Error.prepareStackTrace`/`.stack` walk the real V8 call stack, which does not
+  // stop at this context's boundary: a submission that installs its own
+  // `prepareStackTrace` and reads `.stack` gets CallSite objects for host frames too
+  // (e.g. this file's own path), even though V8 already nulls out `getFunction()`/
+  // `getThis()` on those -- no live host object or code is reachable this way, only
+  // absolute file paths and Node's internal module-loader layout. Nothing in this
+  // codebase reads `.stack`, so it costs nothing to turn capture off entirely here
+  // rather than leave that information available to whatever asks for it.
+  vm.runInContext('Error.stackTraceLimit = 0; Object.defineProperty(Error, "prepareStackTrace", { value: undefined, writable: false, configurable: false })', context);
+
   // Snapshot intrinsics NOW, before any untrusted code runs, so that a later
   // `globalThis.Array = attacker` cannot influence how arguments are constructed.
   const realm = captureRealm(vm.runInContext('globalThis', context));
