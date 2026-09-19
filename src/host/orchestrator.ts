@@ -130,7 +130,12 @@ export async function evaluate(options: EvaluateOptions): Promise<SubmissionRepo
   const startedAt = Date.now();
   const runId = options.runId ?? randomUUID();
   const seed = options.seed ?? (Math.floor(Math.random() * 0xffffffff) >>> 0);
-  const limits: Limits = { ...DEFAULT_LIMITS, ...options.limits, encode: { ...DEFAULT_LIMITS.encode, ...options.limits?.encode } };
+  const limits: Limits = {
+    ...DEFAULT_LIMITS,
+    ...options.limits,
+    encode: { ...DEFAULT_LIMITS.encode, ...options.limits?.encode },
+    determinism: { ...DEFAULT_LIMITS.determinism, ...options.limits?.determinism },
+  };
   const runner = options.runner;
 
   const base = (verdict: Verdict, extra: Partial<SubmissionReport>): SubmissionReport => ({

@@ -216,6 +216,78 @@ function formatForConsole(v: unknown, depth = 0): string {
 interface Compiled {
   fn: (...args: unknown[]) => unknown;
   realm: Realm;
+  /** Present when time/randomness are frozen: rewinds the clock and reseeds before a test. */
+  determinism?: { reset(seed: number): void };
+}
+
+/**
+ * Replaces the context's `Date`, `Math.random` and `Intl.DateTimeFormat#format` with
+ * deterministic versions (README decision #2; see DeterminismSettings).
+ *
+ * Built INSIDE the context from source text, so every function user code can reach
+ * belongs to the context's own realm; a harness-realm closure would hand user code a
+ * path to this realm's `Function` constructor via `.constructor`.
+ *
+ * `Date` becomes a Proxy over the real constructor rather than a subclass, so
+ * `x instanceof Date`, `Date.prototype`, `Date.UTC`/`Date.parse` and dates decoded
+ * from test arguments all keep working unchanged. Only the zero-argument forms read
+ * the clock; `new Date(ms)` and friends are already deterministic and pass through.
+ */
+const DETERMINISM_SHIM = `(function (epochMs, tickMs) {
+  'use strict';
+  const RealDate = Date;
+  let clock = epochMs;
+  let state = 0;
+  const read = () => { const t = clock; clock += tickMs; return t; };
+  const random = () => {
+    // mulberry32: tiny, fast, and fully determined by its 32-bit state.
+    state = (state + 0x6d2b79f5) | 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const FrozenDate = new Proxy(RealDate, {
+    // \`Date()\` called as a function ignores its arguments and stringifies "now".
+    apply() { return new RealDate(read()).toString(); },
+    construct(target, args, newTarget) {
+      return Reflect.construct(target, args.length === 0 ? [read()] : args, newTarget);
+    },
+  });
+  const define = (obj, key, value) =>
+    Object.defineProperty(obj, key, { value, writable: true, configurable: true, enumerable: false });
+  define(RealDate, 'now', function now() { return read(); });
+  // Otherwise \`new (new Date()).constructor()\` would reach the unfrozen constructor.
+  define(RealDate.prototype, 'constructor', FrozenDate);
+  define(globalThis, 'Date', FrozenDate);
+  define(Math, 'random', function random_() { return random(); });
+
+  // Intl formatters default to "now" when called with no date.
+  const dtf = Intl.DateTimeFormat.prototype;
+  const formatGetter = Object.getOwnPropertyDescriptor(dtf, 'format').get;
+  Object.defineProperty(dtf, 'format', {
+    configurable: true,
+    get() {
+      const bound = formatGetter.call(this);
+      return function format(date) { return bound(date === undefined ? read() : date); };
+    },
+  });
+  const formatToParts = dtf.formatToParts;
+  define(dtf, 'formatToParts', function formatToParts_(date) {
+    return formatToParts.call(this, date === undefined ? read() : date);
+  });
+
+  return { reset(seed) { clock = epochMs; state = seed | 0; } };
+})`;
+
+/** FNV-1a over the settings seed and the test id: a stable 32-bit seed per test. */
+function testSeed(seed: number, testId: string): number {
+  let h = 0x811c9dc5 ^ (seed >>> 0);
+  for (let i = 0; i < testId.length; i++) {
+    h ^= testId.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
 }
 
 function compile(req: SandboxRequest): Compiled {
@@ -240,6 +312,18 @@ function compile(req: SandboxRequest): Compiled {
   // Snapshot intrinsics NOW, before any untrusted code runs, so that a later
   // `globalThis.Array = attacker` cannot influence how arguments are constructed.
   const realm = captureRealm(vm.runInContext('globalThis', context));
+
+  // After captureRealm, so argument decoding keeps using the real Date constructor;
+  // before the submission's module code runs, so module-scope reads such as
+  // `const STARTED = Date.now()` are frozen too.
+  const settings = req.limits.determinism;
+  const determinism = settings?.enabled
+    ? (vm.runInContext(DETERMINISM_SHIM, context) as (e: number, t: number) => { reset(seed: number): void })(
+        settings.epochMs,
+        settings.tickMs,
+      )
+    : undefined;
+  determinism?.reset(testSeed(settings.seed, ''));
 
   const shimConsole = vm.runInContext('({})', context) as Record<string, unknown>;
   for (const method of ['log', 'info', 'warn', 'error', 'debug', 'trace', 'dir'] as const) {
@@ -289,7 +373,7 @@ function compile(req: SandboxRequest): Compiled {
   if (typeof fn !== 'function') {
     throw new Error(`entry point '${name}' did not resolve to a function`);
   }
-  return { fn: fn as (...args: unknown[]) => unknown, realm };
+  return { fn: fn as (...args: unknown[]) => unknown, realm, determinism };
 }
 
 // --- per-test execution -------------------------------------------------------
@@ -349,6 +433,10 @@ async function runTest(compiled: Compiled, test: TestInput, req: SandboxRequest,
   } catch (err) {
     return reply(test.id, { type: 'harness_error', detail: `argument decode failed: ${String(err)}` }, encodeArgs([]), started, generation);
   }
+
+  // Same clock and random sequence for this test id wherever it runs: first or last
+  // in the pass, in the oracle or in a rewrite.
+  compiled.determinism?.reset(testSeed(req.limits.determinism.seed, test.id));
 
   let outcome: Outcome;
   let result: unknown;

@@ -166,6 +166,9 @@ export class DockerRunner implements SandboxRunner {
       '--log-driver', 'none',
       '--env', 'SANDBOX_RESULT_FD=1',
       '--env', 'NODE_ENV=production',
+      // Local-time Date methods must not depend on where a challenge was captured or
+      // graded. (The image's default is already UTC; this makes it explicit.)
+      '--env', 'TZ=UTC',
       '--workdir', '/app',
     ];
 

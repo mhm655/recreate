@@ -58,6 +58,32 @@ export interface Limits {
   /** Cap on unattributed stdio captured from the sandbox, in bytes. */
   maxRawOutputBytes: number;
   encode: EncodeBudget;
+  determinism: DeterminismSettings;
+}
+
+/**
+ * Time and randomness inside the sandbox realm (README decision #2).
+ *
+ * With `enabled`, every test starts from the same instant and the same random
+ * sequence: `Date.now()`, `new Date()`, `Date()` and `Intl.DateTimeFormat#format()`
+ * read a logical clock reset to `epochMs`, and `Math.random()` is a PRNG reseeded
+ * from `seed` and the test's id. Reset per test, not per pass, so a test sees the
+ * same values wherever the shuffled pass puts it, and a rewrite sees exactly what
+ * the oracle saw for that test id.
+ */
+export interface DeterminismSettings {
+  enabled: boolean;
+  /** Instant the clock reads at the start of every test, in ms since the epoch. */
+  epochMs: number;
+  /**
+   * How far each clock read advances the clock. Non-zero so elapsed-time loops
+   * (`while (Date.now() - start < 50) {}`) terminate instead of spinning until the
+   * per-test timeout, while staying deterministic: the value depends only on how
+   * many times the clock was read.
+   */
+  tickMs: number;
+  /** Mixed with each test id to seed that test's `Math.random()` sequence. */
+  seed: number;
 }
 
 export interface TestInput {
@@ -154,5 +180,11 @@ export const DEFAULT_LIMITS: Limits = {
     maxStringLength: 16_384,
     maxKeys: 1_000,
     maxCollectionEntries: 1_000,
+  },
+  determinism: {
+    enabled: true,
+    epochMs: Date.UTC(2025, 0, 1),
+    tickMs: 1,
+    seed: 0x5eed,
   },
 };

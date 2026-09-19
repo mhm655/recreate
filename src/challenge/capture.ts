@@ -11,6 +11,7 @@ import { runOracle } from '../evaluator/compare';
 import { encodeArgs } from '../encoding';
 import { generateTests, type GenerateOptions } from '../generator/generate';
 import type { EvaluateOptions } from '../host/orchestrator';
+import { DEFAULT_LIMITS } from '../protocol';
 import type { GenerateMutantsOptions } from '../mutator/mutate';
 import { runMutationTests } from '../mutator/mutation-test';
 import { CHALLENGE_SCHEMA_VERSION, type Challenge, type ChallengeMutationSummary } from './types';
@@ -123,6 +124,9 @@ export async function captureChallenge(options: CaptureOptions): Promise<Capture
     tests,
     droppedTestIds,
     generation: { seed: options.seed ?? 1 },
+    // The settings the oracle actually ran under, resolved exactly as evaluate()
+    // resolves them, so grading can reproduce them.
+    determinism: { ...DEFAULT_LIMITS.determinism, ...options.limits?.determinism },
     // Spread rather than assigned outright, so the key is genuinely absent (not
     // present with value `undefined`) when mutation testing wasn't requested --
     // matching a plain `JSON.parse(JSON.stringify(challenge))` round-trip exactly.
@@ -135,16 +139,18 @@ export async function captureChallenge(options: CaptureOptions): Promise<Capture
 
 /**
  * Content hash of the parts that define this challenge's grading behaviour
- * (entryName, allowedModules, tests) -- not `capturedAt` or `oracleSource`, so two
+ * (entryName, allowedModules, tests, determinism) -- not `capturedAt` or `oracleSource`, so two
  * captures of the same oracle at the same seed get the same id even if the source
  * has been reformatted, and re-capturing later (after the generator improves)
  * produces a genuinely different id when the tests actually differ.
  */
-function contentId(challenge: Pick<Challenge, 'entryName' | 'allowedModules' | 'tests'>): string {
+function contentId(challenge: Pick<Challenge, 'entryName' | 'allowedModules' | 'tests' | 'determinism'>): string {
   const payload = JSON.stringify({
     entryName: challenge.entryName,
     allowedModules: challenge.allowedModules,
     tests: challenge.tests,
+    // Same tests under a different clock or seed expect different outcomes.
+    determinism: challenge.determinism,
   });
   return createHash('sha256').update(payload, 'utf8').digest('hex').slice(0, 16);
 }

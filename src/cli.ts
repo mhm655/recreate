@@ -200,6 +200,13 @@ function loadChallenge(file: string): Challenge {
   if (c.schemaVersion !== CHALLENGE_SCHEMA_VERSION) {
     throw new Error(`${file}: unsupported challenge schemaVersion ${String(c.schemaVersion)} (this tsbox expects ${CHALLENGE_SCHEMA_VERSION})`);
   }
+  if (c.determinism !== undefined) {
+    const d = c.determinism as Partial<NonNullable<Challenge['determinism']>> | null;
+    const numeric = (v: unknown) => typeof v === 'number' && Number.isFinite(v);
+    if (!d || typeof d.enabled !== 'boolean' || !numeric(d.epochMs) || !numeric(d.tickMs) || !numeric(d.seed)) {
+      throw new Error(`${file}: malformed "determinism" (expected { enabled, epochMs, tickMs, seed })`);
+    }
+  }
   return c as Challenge;
 }
 
@@ -270,7 +277,7 @@ function renderAnalysis(a: FunctionAnalysis): string {
   if (g.weaklyTyped.length) lines.push(`  weakly typed: ${g.weaklyTyped.join('; ')}`);
 
   if (a.nondeterminism.length) {
-    lines.push('', 'time / randomness (results vary between runs):');
+    lines.push('', 'time / randomness (frozen per test in the sandbox; a rewrite must read them in the same order):');
     for (const n of a.nondeterminism) lines.push(`  line ${n.line}:${n.column}  ${n.kind}  ${n.snippet}`);
   }
   if (a.moduleState.length) {

@@ -14,7 +14,7 @@
  */
 
 import type { EncodedValue } from '../encoding';
-import type { Outcome } from '../protocol';
+import type { DeterminismSettings, Outcome } from '../protocol';
 
 export const CHALLENGE_SCHEMA_VERSION = 1 as const;
 
@@ -60,6 +60,14 @@ export interface Challenge {
   generation: {
     seed: number;
   };
+  /**
+   * How time and randomness were frozen when the oracle ran (see DeterminismSettings).
+   * Grading always reuses these, whatever limits the grader passes: a rewrite is only
+   * comparable to `expected` if it sees the same clock and random sequence the oracle
+   * saw. Absent on challenges captured before freezing existed; those are graded with
+   * freezing disabled, which is how their oracle ran.
+   */
+  determinism?: DeterminismSettings;
   mutationTesting?: ChallengeMutationSummary;
   capturedAt: string;
 }

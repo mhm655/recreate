@@ -129,6 +129,9 @@ export class LocalRunner implements SandboxRunner {
           ...this.extraEnv,
           SANDBOX_RESULT_FD: '3',
           NODE_OPTIONS: '',
+          // Same as the container: `getHours()`, `toString()` etc. must not depend on
+          // the machine that captured or graded a challenge.
+          TZ: 'UTC',
         },
       },
     );

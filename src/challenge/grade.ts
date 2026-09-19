@@ -8,7 +8,7 @@
 import { decode } from '../encoding';
 import { describeInvalid, mismatchReason, outcomesMatch } from '../evaluator/compare';
 import { evaluate, type EvaluateOptions, type Problem, type SubmissionReport, type TestCase } from '../host/orchestrator';
-import type { Outcome } from '../protocol';
+import { DEFAULT_LIMITS, type Outcome } from '../protocol';
 import type { Challenge } from './types';
 
 export interface GradeAgainstChallengeOptions {
@@ -48,7 +48,12 @@ export async function gradeAgainstChallenge(
     tests: rewriteTests,
     entryName: options.entryName ?? challenge.entryName,
     allowedModules: options.allowedModules ?? challenge.allowedModules,
-    limits: options.limits,
+    limits: {
+      ...options.limits,
+      // Never the grader's choice: the rewrite must see the clock and random
+      // sequence the oracle saw, or `expected` is not comparable.
+      determinism: challenge.determinism ?? { ...DEFAULT_LIMITS.determinism, enabled: false },
+    },
     runner: options.runner,
     seed: options.seed,
   });
