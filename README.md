@@ -2,13 +2,56 @@
 
 [![sandbox](https://github.com/mhm655/recreate/actions/workflows/sandbox.yml/badge.svg)](https://github.com/mhm655/recreate/actions/workflows/sandbox.yml)
 
-The execution layer of a larger tool. That tool captures a real TypeScript function's behaviour as a fixed test suite, with the original implementation as the oracle, then grades a from-scratch rewrite against that suite.
+**Turn any real TypeScript function into a coding challenge, then safely grade other people's rewrites of it.**
 
-This repo is **only** the sandbox and execution harness. It takes a function and a list of inputs, runs the function once per input inside an isolated sandbox, and returns each result in a lossless tagged encoding. Every failure comes back as a structured report, never as a crash or a hang of the calling process.
+Point it at a function you trust. It works out what inputs to try, runs the original on them inside an isolated sandbox, and freezes the results as a test suite. Anyone can then write the function again from scratch, and their version is run in the same sandbox and graded against that captured behaviour. The original source isn't needed again.
 
-Also here: the static analyzer that describes a function's parameters, an input generator built on top of it (type-driven, plus optional LLM-proposed inputs aimed at the function's actual logic), the evaluator that grades a rewrite against a captured oracle using the same generated suite, mutation testing (checks whether a generated suite is actually strong enough to catch a wrong rewrite), and the challenge data model that freezes all of that into a single, self-contained, JSON-safe artifact so grading never again needs the oracle's source.
+<!-- Demo GIF goes here: the ui/ app capturing a challenge and grading a rewrite. -->
 
-A small local demo UI lives in [`ui/`](ui/README.md) -- a separate package that consumes this repo as an ordinary dependency, exactly the way any other consumer would. It runs against `LocalRunner` (no isolation) and exists to drive the pipeline visually, not to grade untrusted code.
+## Quick look
+
+```bash
+npm install && npm run build
+
+# Capture examples/slugify.ts as a challenge.
+node dist/src/cli.js capture --source examples/slugify.ts --out slugify.challenge.json --runner local --unsafe-local
+
+# Grade two rewrites against it.
+node dist/src/cli.js grade --challenge slugify.challenge.json --rewrite examples/slugify.rewrite.ts --runner local --unsafe-local
+node dist/src/cli.js grade --challenge slugify.challenge.json --rewrite examples/slugify.buggy.ts --runner local --unsafe-local
+```
+
+The correct rewrite is written differently and scores 100%. The buggy one forgets to strip accents, and the captured suite catches it:
+
+```
+verdict : FAILED
+score   : 91.7% (11/12)
+  MISMATCH p0-input-4: different return value
+      expected: returned "emoji"
+      rewrite : returned "moji"
+```
+
+(`--runner local` runs without isolation, for trying it on your own code. Untrusted submissions go through the gVisor container runner; see [Setup](#setup).)
+
+## Why this is harder than it looks
+
+- **The code being graded is untrusted.** A submission can loop forever, allocate until the machine falls over, or try to escape and reach the host. It runs in a [gVisor](https://gvisor.dev) container with no network, a read-only filesystem, a syscall allowlist and hard resource limits. The [hostile suite](#hostile-suite) attacks all of that on purpose, in CI, on every push.
+- **"Same output" is subtle.** Plain JSON can't tell a wrong answer from a right one when they differ only in `NaN`, `-0` or `undefined`, and it breaks on `Map`, `Date` and cycles. Results travel in a [lossless tagged encoding](#tagged-encoding), so return values and thrown errors are compared exactly.
+- **Functions aren't always pure.** A hidden counter or cache makes a function's answer depend on call order. Every suite runs twice, in order and shuffled, and order-dependence is flagged instead of silently picking an answer. Time and randomness are frozen per test, so functions that use `Date.now()` or `Math.random()` are still gradable.
+- **A test suite can look complete and still miss bugs.** Inputs come from the function's types plus, optionally, [Claude reading the code](#llm-assisted-inputs-optional) for the values that matter to its logic. [Mutation testing](#mutation-testing) then measures whether the suite would actually catch a wrong rewrite.
+
+## What's in the box
+
+| Piece | What it does |
+|---|---|
+| [Sandbox](#security-model) | gVisor container + host-side supervision: per-test timeouts, memory limits, crash recovery |
+| [Static analyzer](#static-analyzer) | Reads the function's types with the TypeScript checker; never runs the code |
+| [Input generation](#input-generation) | Type-driven edge cases, plus optional LLM-proposed inputs |
+| [Evaluator](#evaluator) and [challenges](#challenge-data-model) | Capture behaviour once as a JSON challenge, grade rewrites forever |
+| [Mutation testing](#mutation-testing) | Checks the suite is strong enough to catch wrong rewrites |
+| [CLI](#usage) and [demo UI](ui/README.md) | Drive the whole pipeline; the UI runs locally without isolation |
+
+The rest of this README covers the security model in detail, including which layers are *not* security boundaries and why, then setup, each component, and what has been [verified where](#verification-status).
 
 ---
 
