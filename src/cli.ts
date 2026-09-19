@@ -18,6 +18,7 @@ import { VENDORED_MODULES } from './bundle';
 import { generateTests } from './generator/generate';
 import { suggestTestsWithLlm, type LlmSuggestOptions } from './generator/llm';
 import { gradeSubmission, type GradeReport } from './evaluator/grade';
+import { ARGS_AFTER_MISMATCH_REASON } from './evaluator/compare';
 import { runMutationTests, type MutationTestReport } from './mutator/mutation-test';
 import { captureChallenge } from './challenge/capture';
 import { gradeAgainstChallenge, type ChallengeGradeReport } from './challenge/grade';
@@ -378,6 +379,10 @@ function render(report: SubmissionReport): string {
   return lines.join('\n');
 }
 
+function clip(text: string, max = 160): string {
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
 function summarize(outcome: SubmissionReport['passes'][number]['results'][number]['outcome']): string {
   switch (outcome.type) {
     case 'return': return `returned ${describeEncoded(outcome.value)}`.slice(0, 160);
@@ -403,6 +408,10 @@ function renderGrade(report: GradeReport): string {
     lines.push(`  MISMATCH ${t.testId}: ${t.reason}`);
     lines.push(`      oracle : ${summarize(t.oracle.outcome)}`);
     lines.push(`      rewrite: ${summarize(t.rewrite.outcome)}`);
+    if (t.reason === ARGS_AFTER_MISMATCH_REASON) {
+      lines.push(`      oracle left args : ${clip(describeEncoded(t.oracle.argsAfterCall))}`);
+      lines.push(`      rewrite left args: ${clip(describeEncoded(t.rewrite.argsAfterCall))}`);
+    }
   }
   return lines.join('\n');
 }
@@ -437,6 +446,10 @@ function renderChallengeGrade(report: ChallengeGradeReport): string {
     lines.push(`  MISMATCH ${t.testId}: ${t.reason}`);
     lines.push(`      expected: ${summarize(t.expected)}`);
     lines.push(`      rewrite : ${summarize(t.rewrite)}`);
+    if (t.expectedArgsAfter && t.rewriteArgsAfter) {
+      lines.push(`      expected args after: ${clip(describeEncoded(t.expectedArgsAfter))}`);
+      lines.push(`      rewrite args after : ${clip(describeEncoded(t.rewriteArgsAfter))}`);
+    }
   }
   return lines.join('\n');
 }

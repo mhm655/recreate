@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { CaptureResult, Challenge, ChallengeGradeReport, ChallengeSummary } from './types';
-import { summarizeOutcome } from './summarize';
+import { describeEncoded, summarizeOutcome } from './summarize';
 
 const EXAMPLE_ORACLE = `export function slugify(input: string, maxLength = 48): string {
   return input
@@ -271,6 +271,12 @@ export default function App() {
                   <div className="mismatch-detail">
                     <div>expected: {summarizeOutcome(t.expected)}</div>
                     <div>rewrite: {summarizeOutcome(t.rewrite)}</div>
+                    {t.expectedArgsAfter && t.rewriteArgsAfter && (
+                      <>
+                        <div>expected args after: {describeEncoded(t.expectedArgsAfter)}</div>
+                        <div>rewrite args after: {describeEncoded(t.rewriteArgsAfter)}</div>
+                      </>
+                    )}
                   </div>
                 </div>
               ))}

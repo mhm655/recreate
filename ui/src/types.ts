@@ -24,6 +24,7 @@ export interface ChallengeTest {
   id: string;
   args: EncodedValue;
   expected: Outcome;
+  expectedArgsAfter?: EncodedValue;
 }
 
 export interface ChallengeMutationSummary {
@@ -56,7 +57,16 @@ export interface Problem {
 
 export type ChallengeTestVerdict =
   | { testId: string; result: 'match' }
-  | { testId: string; result: 'mismatch'; reason: string; expected: Outcome; rewrite: Outcome };
+  | {
+      testId: string;
+      result: 'mismatch';
+      reason: string;
+      expected: Outcome;
+      rewrite: Outcome;
+      /** Present when the outcomes matched but the arguments were left in a different state. */
+      expectedArgsAfter?: EncodedValue;
+      rewriteArgsAfter?: EncodedValue;
+    };
 
 export interface ChallengeGradeReport {
   verdict: 'passed' | 'failed' | 'rewrite_invalid';

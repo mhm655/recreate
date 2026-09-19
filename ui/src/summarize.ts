@@ -18,7 +18,7 @@ function truncationNotes(enc: EncodedValue): string[] {
  * that package is server-only (touches Node's Buffer) and this file is bundled for
  * the browser -- see the note atop ./types.ts.
  */
-function describeEncoded(enc: EncodedValue, seen: Set<number> = new Set()): string {
+export function describeEncoded(enc: EncodedValue, seen: Set<number> = new Set()): string {
   const i = typeof enc.i === 'number' ? enc.i : undefined;
   if (i !== undefined && seen.has(i)) return '<circular reference>';
   const next = i !== undefined ? new Set(seen).add(i) : seen;

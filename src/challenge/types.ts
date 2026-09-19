@@ -24,6 +24,12 @@ export interface ChallengeTest {
   args: EncodedValue;
   /** The oracle's own outcome for this input, frozen at capture time. This -- not the oracle source -- is what a rewrite is graded against. */
   expected: Outcome;
+  /**
+   * The oracle's arguments as it left them after the call, so a rewrite must also
+   * mutate (or not mutate) its inputs the same way. Absent on challenges captured
+   * before this was recorded; those are graded on `expected` alone.
+   */
+  expectedArgsAfter?: EncodedValue;
 }
 
 /**

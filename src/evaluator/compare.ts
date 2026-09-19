@@ -7,7 +7,7 @@
  * an unchanged oracle source once per mutant.
  */
 
-import { canonical } from '../encoding';
+import { canonical, type EncodedValue } from '../encoding';
 import { evaluate, type EvaluateOptions, type Problem, type SubmissionReport, type TestCase } from '../host/orchestrator';
 import type { Outcome, TestResult } from '../protocol';
 
@@ -129,8 +129,27 @@ export function compareToOracle(
 }
 
 function compareOne(testId: string, oracle: TestResult, candidate: TestResult): TestVerdict {
-  if (outcomesMatch(oracle.outcome, candidate.outcome)) return { testId, result: 'match' };
-  return { testId, result: 'mismatch', reason: mismatchReason(oracle.outcome, candidate.outcome), oracle, candidate };
+  if (!outcomesMatch(oracle.outcome, candidate.outcome)) {
+    return { testId, result: 'mismatch', reason: mismatchReason(oracle.outcome, candidate.outcome), oracle, candidate };
+  }
+  if (!argsAfterMatch(oracle.argsAfterCall, candidate.argsAfterCall)) {
+    return { testId, result: 'mismatch', reason: ARGS_AFTER_MISMATCH_REASON, oracle, candidate };
+  }
+  return { testId, result: 'match' };
+}
+
+export const ARGS_AFTER_MISMATCH_REASON = 'same result, but left its arguments in a different state';
+
+/**
+ * Whether the candidate left its arguments in the same state as the oracle did.
+ * What a function does to the objects it was handed is observable behaviour: a
+ * rewrite of an in-place `sortInPlace(xs)` that returns a sorted copy and leaves `xs`
+ * untouched is wrong even though its return value matches. `expected` is undefined
+ * for challenges captured before post-call arguments were recorded; those are
+ * graded on outcomes alone, as they were when captured.
+ */
+export function argsAfterMatch(expected: EncodedValue | undefined, actual: EncodedValue): boolean {
+  return expected === undefined || canonical(expected) === canonical(actual);
 }
 
 /**

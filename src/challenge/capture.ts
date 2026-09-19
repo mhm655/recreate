@@ -109,6 +109,7 @@ export async function captureChallenge(options: CaptureOptions): Promise<Capture
     id: t.id,
     args: encodeArgs(t.args),
     expected: oracleReport.results[t.id].outcome,
+    expectedArgsAfter: oracleReport.results[t.id].argsAfterCall,
   }));
 
   let mutationTesting: ChallengeMutationSummary | undefined;

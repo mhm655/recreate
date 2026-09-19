@@ -5,8 +5,14 @@
  * frozen `expected` outcomes and the rewrite under test.
  */
 
-import { decode } from '../encoding';
-import { describeInvalid, mismatchReason, outcomesMatch } from '../evaluator/compare';
+import { decode, type EncodedValue } from '../encoding';
+import {
+  ARGS_AFTER_MISMATCH_REASON,
+  argsAfterMatch,
+  describeInvalid,
+  mismatchReason,
+  outcomesMatch,
+} from '../evaluator/compare';
 import { evaluate, type EvaluateOptions, type Problem, type SubmissionReport, type TestCase } from '../host/orchestrator';
 import { DEFAULT_LIMITS, type Outcome } from '../protocol';
 import type { Challenge } from './types';
@@ -25,7 +31,16 @@ export type ChallengeGradeVerdict = 'passed' | 'failed' | 'rewrite_invalid';
 
 export type ChallengeTestVerdict =
   | { testId: string; result: 'match' }
-  | { testId: string; result: 'mismatch'; reason: string; expected: Outcome; rewrite: Outcome };
+  | {
+      testId: string;
+      result: 'mismatch';
+      reason: string;
+      expected: Outcome;
+      rewrite: Outcome;
+      /** Present when the outcomes matched but the arguments were left in a different state. */
+      expectedArgsAfter?: EncodedValue;
+      rewriteArgsAfter?: EncodedValue;
+    };
 
 export type ChallengeGradeProblem = Problem;
 
@@ -69,15 +84,29 @@ export async function gradeAgainstChallenge(
   }
 
   const tests: ChallengeTestVerdict[] = challenge.tests.map((t) => {
-    const rewriteOutcome = rewriteReport.results[t.id].outcome;
-    if (outcomesMatch(t.expected, rewriteOutcome)) return { testId: t.id, result: 'match' };
-    return {
-      testId: t.id,
-      result: 'mismatch',
-      reason: mismatchReason(t.expected, rewriteOutcome),
-      expected: t.expected,
-      rewrite: rewriteOutcome,
-    };
+    const rewriteResult = rewriteReport.results[t.id];
+    const rewriteOutcome = rewriteResult.outcome;
+    if (!outcomesMatch(t.expected, rewriteOutcome)) {
+      return {
+        testId: t.id,
+        result: 'mismatch',
+        reason: mismatchReason(t.expected, rewriteOutcome),
+        expected: t.expected,
+        rewrite: rewriteOutcome,
+      };
+    }
+    if (!argsAfterMatch(t.expectedArgsAfter, rewriteResult.argsAfterCall)) {
+      return {
+        testId: t.id,
+        result: 'mismatch',
+        reason: ARGS_AFTER_MISMATCH_REASON,
+        expected: t.expected,
+        rewrite: rewriteOutcome,
+        expectedArgsAfter: t.expectedArgsAfter,
+        rewriteArgsAfter: rewriteResult.argsAfterCall,
+      };
+    }
+    return { testId: t.id, result: 'match' };
   });
   const matches = tests.filter((t) => t.result === 'match').length;
 
