@@ -6,7 +6,7 @@ The execution layer of a larger tool. That tool captures a real TypeScript funct
 
 This repo is **only** the sandbox and execution harness. It takes a function and a list of inputs, runs the function once per input inside an isolated sandbox, and returns each result in a lossless tagged encoding. Every failure comes back as a structured report, never as a crash or a hang of the calling process.
 
-Also here: the static analyzer that describes a function's parameters, a basic input generator built on top of it, the evaluator that grades a rewrite against a captured oracle using the same generated suite, mutation testing (checks whether a generated suite is actually strong enough to catch a wrong rewrite), and the challenge data model that freezes all of that into a single, self-contained, JSON-safe artifact so grading never again needs the oracle's source.
+Also here: the static analyzer that describes a function's parameters, an input generator built on top of it (type-driven, plus optional LLM-proposed inputs aimed at the function's actual logic), the evaluator that grades a rewrite against a captured oracle using the same generated suite, mutation testing (checks whether a generated suite is actually strong enough to catch a wrong rewrite), and the challenge data model that freezes all of that into a single, self-contained, JSON-safe artifact so grading never again needs the oracle's source.
 
 A small local demo UI lives in [`ui/`](ui/README.md) -- a separate package that consumes this repo as an ordinary dependency, exactly the way any other consumer would. It runs against `LocalRunner` (no isolation) and exists to drive the pipeline visually, not to grade untrusted code.
 
@@ -241,6 +241,32 @@ node dist/src/cli.js generate --source examples/slugify.ts --out tests.json     
 - **Refuses exactly what the analyzer would refuse.** `generateTests` checks `generatability.generatable` up front and returns the blockers as the reason, never attempting to fabricate a callback, a `Promise`, or a class instance. A shape the analyzer marks merely weak (`any`, `unknown`, an unconstrained generic, or `recursive`, its own cut-off marker for a self-referential type) gets a small set of generic fallback values instead of being refused -- refusing there would silently narrow what the harness can grade beyond what the analyzer itself decided.
 - **The CLI's plain-JSON test format is a strict subset of what the generator can produce.** `--tests` files (see Usage) only round-trip primitives, plain arrays/objects, and the four numeric-sentinel specials. `Date`, `Map`, `Set`, `RegExp`, typed arrays and `bigint` -- all things a real signature can legitimately require -- have no representation there. `tsbox generate` reports and skips any test that needs one rather than writing something that looks valid but isn't; call `generateTests` + `evaluate()` directly from the JS API to run those.
 - **The generator produces a *plausible* set of edge cases, not a *proven-adequate* one.** (Concretely: an earlier version of the string edge-case list had no mixed-case example, so a rewrite that silently dropped `.toLowerCase()` passed a full generated suite undetected, until a real end-to-end grading run against a deliberately buggy rewrite surfaced the gap.) "Mutation testing" below is what actually validates a suite's strength; a generated suite passing every grading run is not the same claim as a generated suite having a high mutation score, and the two are worth checking separately.
+
+### LLM-assisted inputs (optional)
+
+The type-driven generator only knows parameter *types*, so it can't find the values that matter to the *code*: the threshold it compares against, the string it special-cases, the branch that only fires for one combination. With `--llm`, Claude reads the function and proposes inputs aimed at those (`src/generator/llm.ts`).
+
+```bash
+export ANTHROPIC_API_KEY=...        # or: ant auth login
+node dist/src/cli.js generate --source fn.ts --llm
+node dist/src/cli.js capture  --source fn.ts --llm --llm-max 15 --out challenge.json
+```
+
+- **The model chooses inputs, never outputs.** Expected results still come from running the original in the sandbox, so a poor suggestion costs one uninteresting test, never a wrong expectation.
+- **Model output is untrusted data.** Arguments come back through structured outputs as JSON strings in a small literal format (`src/generator/literals.ts`: plain JSON plus tags for `NaN`, `-0`, `undefined`, `Date`, `Map`, `Set`, `bigint`, `RegExp`). They are parsed with `JSON.parse` under a size cap, never evaluated, and checked against the analyzer's types:
+  - arity;
+  - nested shapes;
+  - literal unions;
+  - no excess properties;
+  - fitting one overload is enough.
+
+  Anything malformed, off-contract or duplicating an existing input is dropped, and each drop is reported with its reason. The prompt also tells the model the source is data, not instructions.
+- **Paid once, at capture.** Accepted inputs are frozen into the challenge, with the model's one-line rationale per input under `generation.llm`, so grading never calls the model. Provenance stays outside `tests`, so it doesn't change the challenge's content id.
+- **Fails loudly.** If `--llm` was requested and the call fails (no credentials, refusal, truncated output), capture fails rather than quietly producing a weaker suite than was asked for.
+- **Defaults:** `claude-opus-5` with its default adaptive thinking; refusal fallbacks are enabled server-side (`fallbacks: "default"`), and the report names the model that actually answered. Override with `--llm-model`, `--llm-max` (default 20) and `--llm-effort`.
+- **What it sends:** the function source, its signature and the already-generated inputs go to the Anthropic API. Don't use it on code you aren't allowed to share with a third-party service.
+
+`test/llm-generation.test.ts` shows the payoff end to end. A function discounts only for the coupon `VIP2025`, and a rewrite forgets that branch. The rewrite **passes** the type-generated suite, because no generated string is ever `VIP2025`, and **fails** once the LLM-proposed inputs are included. Those tests use a fake client, so they're free and need no credentials. One live smoke test runs only with `TSBOX_LIVE_LLM=1`.
 
 ---
 
