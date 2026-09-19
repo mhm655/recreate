@@ -217,7 +217,7 @@ node dist/src/cli.js analyze --source examples/slugify.ts --json   # full Functi
   - *blockers* when required: callbacks, class instances, promises, generator functions;
   - *always omitted* when optional;
   - *weakly typed* when they're `any`, `unknown` or unconstrained generics.
-- **Nondeterminism.** It lists calls to `Date.now()`, `new Date()`, `Date()`, `Math.random()`, `performance.now()` and `crypto.*`, ignoring deterministic forms like `new Date(ms)` and local shadows.
+- **Nondeterminism.** It lists calls to `Date.now()`, `new Date()`, `Date()`, `Math.random()`, `performance.now()` and `crypto.*` (the first four are frozen per test in the sandbox; the last two don't exist there), ignoring deterministic forms like `new Date(ms)` and local shadows.
 - **Module state.** It lists top-level bindings and containers that the function *writes to from inside a function body*: reassigned `let`s, `Map`/`Set`/array/object mutation. Read-only lookup tables and module initialisation aren't flagged. These are hints; the harness's two-pass run is the authoritative check.
 - **Same screening as the harness.** Analysis applies the import allowlist and the same entry-point rules, so it never describes a function the sandbox would refuse, or a different function from the one it would run.
 - **Can't read the disk.** The compiler host serves only the in-memory submission and TypeScript's ES2022 lib declarations. Even an allowlisted import comes back as an unresolved type; there's a test proving a real file on disk isn't read. There's no DOM or `@types/node`, matching the sandbox realm.
@@ -389,7 +389,7 @@ The tamper tests inject a `--require` preload into the sandbox process. It attac
 Decided (2026-09-16):
 
 1. **An order-sensitive original is rejected as an oracle,** with the divergences as the reason. A per-test fresh-sandbox mode is possible later if real functions need it.
-2. **Time and randomness will be frozen or seeded inside the sandbox realm,** so functions using `Date.now()` or `Math.random()` become testable. *Not implemented yet:* until then the analyzer lists these call sites and the harness flags such functions `nondeterministic`.
+2. **Time and randomness are frozen per test inside the sandbox realm** (`DeterminismSettings` in `src/protocol.ts`, on by default). Every test starts at the same instant, `2025-01-01T00:00:00Z`: `Date.now()`, `new Date()`, `Date()` and `Intl.DateTimeFormat#format()` read a logical clock that advances 1 ms per read, so elapsed-time loops still finish. `Math.random()` is reseeded from the test id. Because it resets per test, a test sees the same values wherever the shuffled pass puts it, and a rewrite sees exactly what the oracle saw. A challenge records the settings it was captured with, and grading always reuses them. Local time is pinned to UTC in both runners. *Not frozen:* the default locale for `toLocaleString()`-style formatting, which follows the machine running the sandbox. It's fixed inside the container but can differ under `LocalRunner`.
 3. **Thrown errors match on error class plus normalised message.** Class-only matching can be a per-challenge option.
 4. **Inputs on which the original times out are dropped** during generation instead of being kept as expected timeouts.
 

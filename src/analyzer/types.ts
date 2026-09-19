@@ -126,9 +126,11 @@ export interface FunctionAnalysis {
   /** More than one entry means the function is overloaded; the implementation signature is excluded. */
   signatures: SignatureInfo[];
   /**
-   * Calls whose results change between runs. Project decision: these are to be
-   * frozen/seeded inside the sandbox so such functions become testable. That is not
-   * implemented yet; until it is, the harness flags them as nondeterministic.
+   * Calls that read the clock or random numbers. Inside the sandbox these are frozen
+   * and seeded per test (see DeterminismSettings in src/protocol.ts), so they no
+   * longer make a function untestable; the list says what a rewrite must reproduce
+   * exactly -- same number and order of clock reads and random draws -- to match.
+   * `performance`/`crypto` do not exist in the sandbox realm at all.
    */
   nondeterminism: NondeterminismSource[];
   /**
